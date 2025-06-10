@@ -53,9 +53,6 @@ def _mute_output():
 class HFVerifyWorker:
     def __init__(self) -> None:
         logging.getLogger("math_verify").setLevel(logging.CRITICAL)
-
-        # Use Latex and plain math extraction from predictions
-        # https://github.com/huggingface/Math-Verify?tab=readme-ov-file#extraction-targets
         self.verify_func = math_metric(
             gold_extraction_target=(LatexExtractionConfig(),),
             pred_extraction_target=(
@@ -67,15 +64,6 @@ class HFVerifyWorker:
     def verify(
         self, pred_responses: list[str], ground_truths: list[str]
     ) -> list[float]:
-        """Verify the correctness of the predicted responses against the ground truth.
-
-        Args:
-            pred_responses: list[str]. The predicted responses from the LLM.
-            ground_truths: list[str]. The ground truth responses.
-
-        Returns:
-            list[float]. The rewards for each predicted response.
-        """
         results = []
         for response, ground_truth in zip(pred_responses, ground_truths):
             try:
@@ -85,12 +73,8 @@ class HFVerifyWorker:
                         ret_score, _ = self.verify_func(
                             [ground_truth_parsable], [response]
                         )
-                    # It's possible to emit a TimeoutException and that wouldn't be caught since
-                    # it actually subclasses from BaseException and math-verify itself does not
-                    # to catch it.
                     except (Exception, TimeoutException):
                         ret_score = 0.0
-
                 results.append(float(ret_score))
             except Exception:
                 results.append(0.0)
@@ -100,45 +84,24 @@ class HFVerifyWorker:
 class MathEnvironmentMetadata(TypedDict):
     ground_truth: str
 
-
-@ray.remote(max_restarts=-1, max_task_retries=-1)
-class MathEnvironment(EnvironmentInterface):
+# NEW: Create a non-actor base class with the shared logic.
+# Note: No @ray.remote decorator here!
+class BaseMathEnvironment(EnvironmentInterface):
     def __init__(self, cfg: MathEnvConfig):
         self.cfg = cfg
         self.num_workers = cfg["num_workers"]
-        self.workers = [
-            HFVerifyWorker.options(  # type: ignore # (decorated with @ray.remote)
-                runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}
-            ).remote()
-            for _ in range(self.num_workers)
-        ]
+        # The `self.workers` list will be populated by the subclasses
+        self.workers = []
 
     def shutdown(self) -> None:
-        # shutdown all workers
         for worker in self.workers:
             ray.kill(worker)
 
-    def step(  # type: ignore[override]
+    def step(
         self,
         message_log_batch: list[list[dict[str, str]]],
         metadata: list[MathEnvironmentMetadata],
     ) -> EnvironmentReturn:
-        """Runs a step in the math environment.
-
-        Args:
-            message_log: list[list[dict[str, str]]]. A batch of OpenAI-API-like message logs that represent interactions with the LLM.
-            metadata: list[MathEnvironmentMetadata]. The grader will use the 'ground_truth' key to evaluate correctness.
-
-        Returns:
-            EnvironmentReturn: A tuple containing:
-                - list[dict[str, str]]: Observations/responses batch
-                - list[dict]: Updated metadata
-                - list[str]: Next stop strings for the next turn
-                - Tensor: Rewards tensor
-                - Tensor: Done flags tensor
-        """
-        # Extract the assistant's responses from the message history
-        # Each message list should have at least one assistant response
         assistant_response_batch = []
         for conversation in message_log_batch:
             assistant_responses = [
@@ -149,23 +112,18 @@ class MathEnvironment(EnvironmentInterface):
             assistant_response_batch.append("".join(assistant_responses))
 
         ground_truths = [g["ground_truth"] for g in metadata]
-
         chunked_assistant_response_batch = chunk_list_to_workers(
             assistant_response_batch, self.num_workers
         )
         chunked_ground_truths = chunk_list_to_workers(ground_truths, self.num_workers)
 
-        # # Process each chunk in parallel
         futures = [
             self.workers[i].verify.remote(chunk, ground_truth_chunk)
             for i, (chunk, ground_truth_chunk) in enumerate(
                 zip(chunked_assistant_response_batch, chunked_ground_truths)
             )
         ]
-
         results = ray.get(futures)
-
-        # flatten the results
         results = [item for sublist in results for item in sublist]
         observations = [
             {
@@ -177,10 +135,8 @@ class MathEnvironment(EnvironmentInterface):
             for result in results
         ]
 
-        # create a tensor of rewards and done flags
         rewards = torch.tensor(results).cpu()
         done = torch.ones_like(rewards).cpu()
-
         next_stop_strings = [None] * len(message_log_batch)
 
         return EnvironmentReturn(
@@ -194,14 +150,9 @@ class MathEnvironment(EnvironmentInterface):
     def global_post_process_and_metrics(
         self, batch: BatchedDataDict[Any]
     ) -> tuple[BatchedDataDict[Any], dict[str, float | int]]:
-        """Computes metrics for this environment given a global rollout batch.
-
-        Every rank will run this function, so you're free to use distributed
-        calculations if you'd prefer for heavy metrics.
-        """
         batch["rewards"] = (
             batch["rewards"] * batch["is_end"]
-        )  # set a reward of 0 for any incorrectly ended sequences
+        )
         if (batch["rewards"] == 1).float().sum() > 0:
             correct_solution_generation_lengths = (
                 (batch["generation_lengths"] - batch["prompt_lengths"])[
@@ -215,7 +166,6 @@ class MathEnvironment(EnvironmentInterface):
             correct_solution_generation_lengths = 0
 
         metrics = {
-            # "table": table, TODO @sahilj WIP
             "accuracy": batch["rewards"].mean().item(),
             "pass@samples_per_prompt": calculate_pass_rate_per_prompt(
                 batch["text"], batch["rewards"]
@@ -226,5 +176,19 @@ class MathEnvironment(EnvironmentInterface):
             "prompt_lengths": batch["prompt_lengths"].float().mean().item(),
             "correct_solution_generation_lengths": correct_solution_generation_lengths,
         }
-
         return batch, metrics
+
+
+# MODIFIED: MathEnvironment is now an actor that inherits from the non-actor base class.
+@ray.remote(max_restarts=-1, max_task_retries=-1)
+class MathEnvironment(BaseMathEnvironment):
+    def __init__(self, cfg: MathEnvConfig):
+        # Initialize the base class
+        super().__init__(cfg)
+        # Initialize the specific workers for this environment
+        self.workers = [
+            HFVerifyWorker.options(
+                runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}
+            ).remote()
+            for _ in range(self.num_workers)
+        ]

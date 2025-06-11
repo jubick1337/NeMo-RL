@@ -367,6 +367,7 @@ def grpo_train(
             val_task_to_env,
             step=0,
             master_config=master_config,
+            logger=logger,  # Pass the logger object
         )
         policy_generation.finish_generation()
         logger.log_metrics(val_metrics, step, prefix="validation")
@@ -522,6 +523,7 @@ def grpo_train(
                     val_task_to_env,
                     step=step + 1,
                     master_config=master_config,
+                    logger=logger,  # Pass the logger object
                 )
                 policy_generation.finish_generation()
                 logger.log_metrics(
@@ -537,8 +539,10 @@ def grpo_train(
             ):  # +1 because step is 0-indexed
                 policy.prepare_for_training()
 
+                # val_metrics will only be defined on validation steps, handle this
+                val_reward_for_ckpt = val_metrics["accuracy"] if val_metrics else grpo_save_state["val_reward"]
                 grpo_save_state["step"] = step + 1
-                grpo_save_state["val_reward"] = val_metrics["accuracy"]
+                grpo_save_state["val_reward"] = val_reward_for_ckpt
                 grpo_save_state["consumed_samples"] = consumed_samples
                 with timer.time("checkpointing"):
                     print(f"Saving checkpoint for step {step + 1}...")
@@ -569,7 +573,10 @@ def grpo_train(
         log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
         log_data["input_lengths"] = input_lengths.tolist()
         logger.log_batched_dict_as_jsonl(log_data, f"train_data_step{step}.jsonl")
+        
+        # Convenient Logging Block
         try:
+            # 1. Prepare data for the entire batch.
             convenient_inputs = []
             convenient_outputs = []
             convenient_rewards = log_data["rewards"]
@@ -591,6 +598,7 @@ def grpo_train(
                     convenient_inputs.append("ERROR: Could not parse input.")
                     convenient_outputs.append("ERROR: Could not parse output.")
 
+            # 2. Assemble the full dictionary for logging, using the 0-indexed `step`.
             num_samples_in_batch = len(convenient_inputs)
             convenient_log_data = {
                 "step": [step] * num_samples_in_batch,
@@ -598,11 +606,16 @@ def grpo_train(
                 "output": convenient_outputs,
                 "reward": convenient_rewards,
             }
+            
+            # 3. Log the full and sliced convenient data if the batch is not empty.
             if num_samples_in_batch > 0:
+                # Log full data to a per-step file, using 0-indexed `step`.
                 logger.log_batched_dict_as_jsonl(
                     convenient_log_data,
                     f"train_data_convinient_{step}.jsonl"
                 )
+
+                # Create and log a smaller file with the first 32 samples.
                 num_small_samples = 32
                 first_32_log_data = {
                     key: value[:num_small_samples] for key, value in convenient_log_data.items()
@@ -612,8 +625,8 @@ def grpo_train(
                     f"train_data_convinient_{step}_first_32.jsonl"
                 )
         except Exception as e:
-            # The error message also uses the 0-indexed `step`.
             print(f"⚠️ Error logging convenient data for step {step}: {str(e)}. Continuing without convenient logging.")
+
 
         print("\n📊 Training Results:")
         metrics = {
@@ -662,10 +675,11 @@ def grpo_train(
 def validate(
     policy_generation: GenerationInterface,
     val_dataloader: Optional[StatefulDataLoader],
-    tokenizer,
+    tokenizer: TokenizerType,
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     step: int,
     master_config: MasterConfig,
+    logger: Logger,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run validation on the validation dataset."""
     if val_dataloader is None:
@@ -678,7 +692,7 @@ def validate(
 
         total_rewards = []
         total_lengths = []
-        all_message_logs = []  # Collect all message logs
+        all_message_logs = []  # This will store all generated conversations
 
         max_batches = (
             master_config["grpo"]["max_val_samples"]
@@ -688,7 +702,7 @@ def validate(
             if batch_idx >= max_batches:
                 break
 
-            # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
+            # This function runs generation and returns the updated batch with message logs
             val_batch, gen_metrics = run_multi_turn_rollout(
                 policy_generation,
                 val_batch,
@@ -700,29 +714,31 @@ def validate(
             )
             rewards = val_batch["total_reward"]
 
+            if 'binarize_val_rewards' in master_config["grpo"] and master_config["grpo"]["binarize_val_rewards"]:
+                # If binary rewards are enabled, convert to binary rewards
+                rewards = val_batch["total_reward"] > 0.0  # Convert to binary rewards (1 for positive, 0 for negative)
+
             total_rewards.extend(rewards.tolist())
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
 
-            # Collect message logs for later display
             to_env = [
                 get_keys_from_message_log(
                     val_batch["message_log"][i], ["role", "content"]
                 )
                 for i in range(len(val_batch["message_log"]))
             ]
-
             all_message_logs.extend(to_env)
 
         # Calculate validation metrics
-        accuracy = sum(total_rewards) / len(total_rewards)
-        avg_length = sum(total_lengths) / len(total_lengths)
+        accuracy = sum(total_rewards) / len(total_rewards) if total_rewards else 0
+        avg_length = sum(total_lengths) / len(total_lengths) if total_lengths else 0
 
         val_metrics = {
             "accuracy": accuracy,
             "avg_length": avg_length,
         }
 
-        # Print sample conversations only once at the end of validation
+        # Print sample conversations
         try:
             print_message_log_samples(
                 all_message_logs,
@@ -736,6 +752,53 @@ def validate(
         except Exception as e:
             print(f"\n  ⚠️ Error displaying message samples: {str(e)}")
             print("  ⚠️ Continuing validation without displaying samples...")
+            
+        # Convenient Validation Logging
+        try:
+            convenient_val_inputs = []
+            convenient_val_outputs = []
+            
+            # Use the per-sample rewards collected during the loop
+            convenient_val_rewards = total_rewards
+
+            # Iterate over the collected message logs
+            for conversation_turns in all_message_logs:
+                user_prompt = "ERROR: User prompt not found."
+                assistant_response = "ERROR: Assistant response not found."
+                # Find the user and assistant content robustly
+                for turn in conversation_turns:
+                    if turn.get("role") == "user":
+                        user_prompt = turn.get("content", "")
+                    elif turn.get("role") == "assistant":
+                        assistant_response = turn.get("content", "")
+                
+                convenient_val_inputs.append(user_prompt)
+                convenient_val_outputs.append(assistant_response)
+
+            num_samples = len(convenient_val_inputs)
+            if num_samples > 0:
+                convenient_val_log_data = {
+                    "step": [step] * num_samples,
+                    "input": convenient_val_inputs,
+                    "output": convenient_val_outputs,
+                    "reward": convenient_val_rewards,
+                }
+                
+                logger.log_batched_dict_as_jsonl(
+                    convenient_val_log_data,
+                    f"val_data_convenient_{step}.jsonl"
+                )
+                
+                num_small_samples = 32
+                first_32_log_data = {
+                    key: value[:num_small_samples] for key, value in convenient_val_log_data.items()
+                }
+                logger.log_batched_dict_as_jsonl(
+                    first_32_log_data,
+                    f"val_data_convenient_{step}_first_32.jsonl"
+                )
+        except Exception as e:
+            print(f"⚠️ Error logging convenient validation data for step {step}: {str(e)}. Continuing without convenient logging.")
 
     # Get timing metrics
     timing_metrics = timer.get_timing_metrics(reduction_op="sum")

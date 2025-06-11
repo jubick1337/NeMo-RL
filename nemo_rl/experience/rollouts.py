@@ -374,6 +374,11 @@ def run_multi_turn_rollout(
     # Add total rewards to the final batch
     current_batch["total_reward"] = total_rewards
 
+    current_batch["min_reward"] = total_rewards.min().item()
+    current_batch["max_reward"] = total_rewards.max().item()
+    current_batch["mean_reward"] = total_rewards.mean().item()
+    current_batch["std_reward"] = total_rewards.std().item()
+
     # Calculate aggregate metrics
     rollout_metrics = {
         # Overall metrics

@@ -569,6 +569,15 @@ def grpo_train(
         log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
         log_data["input_lengths"] = input_lengths.tolist()
         logger.log_batched_dict_as_jsonl(log_data, f"train_data_step{step}.jsonl")
+        try:
+            convinient_log_data = {'input': log_data["content"][1], 'output': log_data["content"][2], 'reward': log_data["rewards"]}
+            logger.log_batched_dict_as_jsonl(
+                convinient_log_data, f"train_data_step{step}_convinient.jsonl"
+            )
+        except Exception as e:
+            print(
+                f"⚠️ Error logging convinient data for step {step}: {str(e)}. Continuing without convinient logging."
+            )
 
         print("\n📊 Training Results:")
         metrics = {

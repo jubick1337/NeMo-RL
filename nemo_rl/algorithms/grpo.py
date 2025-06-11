@@ -714,10 +714,6 @@ def validate(
             )
             rewards = val_batch["total_reward"]
 
-            if 'binarize_val_rewards' in master_config["grpo"] and master_config["grpo"]["binarize_val_rewards"]:
-                # If binary rewards are enabled, convert to binary rewards
-                rewards = val_batch["total_reward"] > 0.0  # Convert to binary rewards (1 for positive, 0 for negative)
-
             total_rewards.extend(rewards.tolist())
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
 
@@ -731,6 +727,10 @@ def validate(
 
         # Calculate validation metrics
         accuracy = sum(total_rewards) / len(total_rewards) if total_rewards else 0
+        if 'binarize_val_rewards' in master_config["grpo"] and master_config["grpo"]["binarize_val_rewards"]:
+            # If binary rewards are enabled, convert to accuracy
+            accuracy = sum(1 for r in total_rewards if r > 0) / len(total_rewards) if total_rewards else 0
+
         avg_length = sum(total_lengths) / len(total_lengths) if total_lengths else 0
 
         val_metrics = {

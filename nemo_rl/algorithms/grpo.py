@@ -570,48 +570,49 @@ def grpo_train(
         log_data["input_lengths"] = input_lengths.tolist()
         logger.log_batched_dict_as_jsonl(log_data, f"train_data_step{step}.jsonl")
         try:
-            # Prepare lists to hold the convenient log data for each sample in the batch
             convenient_inputs = []
             convenient_outputs = []
-                
-            # The rewards list is already in the correct format (one per sample)
             convenient_rewards = log_data["rewards"]
 
-            # Iterate through each sample in the batch
             for i in range(len(log_data["content"])):
                 conversation_turns = log_data["content"][i]
-                    
-                # Ensure the conversation has the expected number of turns
+                
                 if len(conversation_turns) > 2:
-                    # The user prompt is the second turn
                     user_prompt = conversation_turns[1]
-                    # The assistant response is the third turn
                     assistant_response = conversation_turns[2]
 
-                    # Clean up the user prompt which incorrectly contains the assistant's start tag
                     assistant_start_tag = "<|im_start|>assistant\n"
                     if user_prompt.endswith(assistant_start_tag):
                         user_prompt = user_prompt[:-len(assistant_start_tag)]
-
+                    
                     convenient_inputs.append(user_prompt)
                     convenient_outputs.append(assistant_response)
                 else:
-                    # Handle cases with unexpected turn structure to avoid errors
                     convenient_inputs.append("ERROR: Could not parse input.")
                     convenient_outputs.append("ERROR: Could not parse output.")
 
-                # Assemble the final dictionary for the logger.
-                # The logger expects a dictionary of lists.
-                convenient_log_data = {
-                    "input": convenient_inputs,
-                    "output": convenient_outputs,
-                    "reward": convenient_rewards,
-                }
-                
+            num_samples_in_batch = len(convenient_inputs)
+            convenient_log_data = {
+                "step": [step] * num_samples_in_batch,
+                "input": convenient_inputs,
+                "output": convenient_outputs,
+                "reward": convenient_rewards,
+            }
+            if num_samples_in_batch > 0:
                 logger.log_batched_dict_as_jsonl(
-                    convenient_log_data, f"train_data_step{step}_convenient.jsonl"
+                    convenient_log_data,
+                    f"train_data_convinient_{step}.jsonl"
+                )
+                num_small_samples = 32
+                first_32_log_data = {
+                    key: value[:num_small_samples] for key, value in convenient_log_data.items()
+                }
+                logger.log_batched_dict_as_jsonl(
+                    first_32_log_data,
+                    f"train_data_convinient_{step}_first_32.jsonl"
                 )
         except Exception as e:
+            # The error message also uses the 0-indexed `step`.
             print(f"⚠️ Error logging convenient data for step {step}: {str(e)}. Continuing without convenient logging.")
 
         print("\n📊 Training Results:")

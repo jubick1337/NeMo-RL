@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import Any
+
 import torch
 
 try:
@@ -24,6 +26,21 @@ except ImportError:
 
 
 class VllmInternalWorkerExtension:
+    def init_collective(
+        self, rank_prefix: int, ip: str, port: int, world_size: int
+    ) -> None:
+        """Initialize the collective communication."""
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+        from vllm.distributed.utils import StatelessProcessGroup
+
+        local_rank = torch.distributed.get_rank()
+        rank = rank_prefix + local_rank + 1  # 1 is the head node of the train cluster
+
+        pg = StatelessProcessGroup.create(
+            host=ip, port=port, rank=rank, world_size=world_size
+        )
+        self.model_update_group = PyNcclCommunicator(pg, device=self.device)
+
     def report_device_id(self) -> str:
         from nemo_rl.utils.nvml import get_device_uuid
 
@@ -42,17 +59,40 @@ class VllmInternalWorkerExtension:
             # Get handles for this device
             device_uuid = self.report_device_id()
             handles = ipc_handles[device_uuid]
+            is_tensor_packed = handles[0]
+            if is_tensor_packed:
+                _, all_handles, tensor_metadata = handles
+            else:
+                _, name_and_handle_list = handles
+
             device_id = self.device.index
             weights = []
 
-            # Process each handle to get the tensor
-            for name, handle in handles:
-                func, args = handle
-                list_args = list(args)
-                # Update device ID to match the current device
-                list_args[6] = device_id
-                tensor = func(*list_args)
-                weights.append((name, tensor))
+            if is_tensor_packed:
+                # Extract packed tensor from IPC handle
+                dtype_to_packed_tensor = {}
+                for dtype, tensor_handle in all_handles:
+                    func, args = tensor_handle
+                    list_args = list(args)
+                    list_args[6] = device_id
+                    tensor = func(*list_args)
+                    dtype_to_packed_tensor[dtype] = tensor
+
+                # Unpack tensor to weights. Here we only return a view of the tensor to avoid
+                # using extra memory.
+                for key, (shape, dtype, offset, size) in tensor_metadata.items():
+                    tensor = dtype_to_packed_tensor[dtype][offset : offset + size].view(
+                        *shape
+                    )
+                    weights.append((key, tensor))
+            else:
+                # Process each handle to get the tensor
+                for name, handle in name_and_handle_list:
+                    func, args = handle
+                    list_args = list(args)
+                    list_args[6] = device_id
+                    tensor = func(*list_args)
+                    weights.append((name, tensor))
 
             # Load weights into the model
             self.model_runner.model.load_weights(weights=weights)
@@ -63,3 +103,18 @@ class VllmInternalWorkerExtension:
                 f"Error in VllmInternalWorkerExtension.update_weights_from_ipc_handles: {e}"
             )
             return False
+
+    def update_weights_from_collective(self, info: dict[str, Any]) -> bool:
+        """Update the model weights from collective communication."""
+        try:
+            for name, (shape, dtype) in info.items():
+                weight = torch.empty(shape, dtype=dtype, device="cuda")
+                self.model_update_group.broadcast(weight, src=0)
+                self.model_runner.model.load_weights(weights=[(name, weight)])
+        except Exception as e:
+            print(
+                f"Error in VllmInternalWorkerExtension.update_weights_from_collective: {e}"
+            )
+            return False
+
+        return True

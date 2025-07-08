@@ -14,6 +14,7 @@ apt-get install -y --no-install-recommends \
     curl \
     git \
     rsync \
+    wget \
     less \
     vim \
 
@@ -39,6 +40,8 @@ RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
 # Disable usage stats by default for users who are sensitive to sharing usage.
 # Users are encouraged to enable if the wish.
 ENV RAY_USAGE_STATS_ENABLED=0
+ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+
 
 FROM base AS hermetic
 
@@ -73,6 +76,9 @@ uv sync --link-mode symlink --locked --all-groups --no-install-project
 EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
+ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+
+WORKDIR /opt/nemo-rl
 
 FROM hermetic AS release
 
@@ -85,7 +91,8 @@ ENV NVIDIA_BUILD_REF=${NVIDIA_BUILD_REF:-<unknown>}
 LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
-COPY . /opt/nemo-rl
+ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 
-# Make hermetic the default target instead of release since that's the recommended container
-FROM hermetic
+# Copy in source and prefetch all virtual environments
+COPY . /opt/nemo-rl
+RUN UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py

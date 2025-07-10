@@ -12,10 +12,23 @@ from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 from nemo_rl.environments.math_environment import MathEnvConfig, BaseMathEnvironment, _mute_output
 
+class ConfidenceEnvConfig(MathEnvConfig, total=False):
+    reward_correct_high: float
+    reward_correct_low: float
+    reward_incorrect_low: float
+    reward_incorrect_confident: float
+    reward_no_confidence: float
 
 @ray.remote
 class HFVerifyWorkerConfidence:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        reward_correct_high: float = 2.0,
+        reward_correct_low: float = 1.0,
+        reward_incorrect_low: float = 0.0,
+        reward_incorrect_confident: float = -1.0,
+        reward_no_confidence: float = -2.0,
+    ) -> None:
         logging.getLogger("math_verify").setLevel(logging.CRITICAL)
         self.verify_func = math_metric(
             gold_extraction_target=(LatexExtractionConfig(),),
@@ -24,6 +37,11 @@ class HFVerifyWorkerConfidence:
                 LatexExtractionConfig(),
             ),
         )
+        self.reward_correct_high = reward_correct_high
+        self.reward_correct_low = reward_correct_low
+        self.reward_incorrect_low = reward_incorrect_low
+        self.reward_incorrect_confident = reward_incorrect_confident
+        self.reward_no_confidence = reward_no_confidence
 
     def parse_confidence(self, response: str) -> Optional[float]:
         """
@@ -83,53 +101,60 @@ class HFVerifyWorkerConfidence:
 
             if correctness_score == 1.0:
                 if confidence_score_val == 1.0:
-                    results.append(2.0)  # Correct & High Confidence
+                    results.append(self.reward_correct_high)  # Correct & High Confidence
                 elif confidence_score_val == 0.0:
-                    results.append(1.0)  # Correct & Low Confidence
+                    results.append(self.reward_correct_low)  # Correct & Low Confidence
                 else:
-                    results.append(-2.0)  # Correct but no confidence found
+                    results.append(self.reward_no_confidence)  # Correct but no confidence found
             else:  # correctness_score == 0.0
                 if confidence_score_val == 0.0:
-                    results.append(0.0)  # Incorrect & Low Confidence
+                    results.append(self.reward_incorrect_low)  # Incorrect & Low Confidence
                 elif confidence_score_val == 1.0:
-                    results.append(-1.0)  # Incorrect & High Confidence
+                    results.append(self.reward_incorrect_confident)  # Incorrect & High Confidence
                 else:
-                    results.append(-2.0)  # Incorrect and no confidence found
+                    results.append(self.reward_no_confidence)  # Incorrect and no confidence found
 
         return results
 
-
-# MODIFIED: Inherit from the non-actor BaseMathEnvironment
 @ray.remote(max_restarts=-1, max_task_retries=-1)
 class ConfidenceEnvironment(BaseMathEnvironment):
-    def __init__(self, config: MathEnvConfig) -> None:
+    def __init__(self, config: ConfidenceEnvConfig) -> None:
         # Initialize the base class
         super().__init__(config)
-        # Initialize the specific workers for this environment
+        reward_config = {
+            "reward_correct_high": config.get("reward_correct_high", 2.0),
+            "reward_correct_low": config.get("reward_correct_low", 1.0),
+            "reward_incorrect_low": config.get("reward_incorrect_low", 0.0),
+            "reward_incorrect_confident": config.get("reward_incorrect_confident", -1.0),
+            "reward_no_confidence": config.get("reward_no_confidence", -2.0),
+        }
         self.workers = [
-            HFVerifyWorkerConfidence.options(runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}).remote()
+            HFVerifyWorkerConfidence.options(runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}).remote(**reward_config)
             for _ in range(self.num_workers)
         ]
 
     def global_post_process_and_metrics(
-        self, batch: BatchedDataDict[Any]
-    ) -> tuple[BatchedDataDict[Any], dict[str, float | int]]:
-        # This method is already correct and doesn't need changes.
+    self, batch: BatchedDataDict[Any]
+) -> tuple[BatchedDataDict[Any], dict[str, float | int]]:
         original_rewards = batch["rewards"].clone()
-        batch["rewards"] = batch["rewards"] * batch["is_end"]
-        is_correct = (original_rewards == 2.0) | (original_rewards == 1.0)
+        is_correct = (original_rewards == self.reward_correct_high) | (original_rewards == self.reward_correct_low)
         is_correct_float = is_correct.float()
 
-        if is_correct.float().sum() > 0:
+        batch["rewards"] = batch["rewards"] * batch["is_end"]
+        
+        if is_correct_float.sum() > 0:
             correct_solution_generation_lengths = (
                 (batch["generation_lengths"] - batch["prompt_lengths"])[is_correct].float().mean().item()
             )
         else:
             correct_solution_generation_lengths = 0
 
-        num_high_confidence = ((original_rewards == 2.0) | (original_rewards == -1.0)).float().sum()
+        num_high_confidence = (
+            (original_rewards == self.reward_correct_high) | (original_rewards == self.reward_incorrect_confident)
+        ).float().sum()
+        
         if num_high_confidence > 0:
-            precision_of_high_confidence = (original_rewards == 2.0).float().sum() / num_high_confidence
+            precision_of_high_confidence = (original_rewards == self.reward_correct_high).float().sum() / num_high_confidence
         else:
             precision_of_high_confidence = 0.0
 
@@ -140,11 +165,13 @@ class ConfidenceEnvironment(BaseMathEnvironment):
             "accuracy": accuracy,
             "pass@samples_per_prompt": calculate_pass_rate_per_prompt(batch["text"], is_correct_float),
             "precision_of_high_confidence": precision_of_high_confidence.item(),
-            "frac_correct_confident": (original_rewards == 2.0).float().mean().item(),
-            "frac_correct_unconfident": (original_rewards == 1.0).float().mean().item(),
-            "frac_incorrect_unconfident": (original_rewards == 0.0).float().mean().item(),
-            "frac_incorrect_confident": (original_rewards == -1.0).float().mean().item(),
-            "frac_no_confidence_found": (original_rewards == -2.0).float().mean().item(),
+            
+            "frac_correct_confident": (original_rewards == self.reward_correct_high).float().mean().item(),
+            "frac_correct_unconfident": (original_rewards == self.reward_correct_low).float().mean().item(),
+            "frac_incorrect_unconfident": (original_rewards == self.reward_incorrect_low).float().mean().item(),
+            "frac_incorrect_confident": (original_rewards == self.reward_incorrect_confident).float().mean().item(),
+            "frac_no_confidence_found": (original_rewards == self.reward_no_confidence).float().mean().item(),
+            
             "fraction_of_samples_properly_ended": batch["is_end"].float().mean().item(),
             "num_problems_in_batch": batch["is_end"].shape[0],
             "generation_lengths": batch["generation_lengths"].float().mean().item(),

@@ -628,6 +628,58 @@ def grpo_train(
                         advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
                     )
 
+            # convenient logging block moved here
+            try:
+                # Use the final `repeated_batch` which contains the complete conversations
+                # This is simpler and more robust, just like the validation logger.
+                complete_message_logs = get_keys_from_message_log(
+                    repeated_batch["message_log"], ["role", "content"]
+                )
+
+                convenient_train_inputs = []
+                convenient_train_outputs = []
+
+                for conversation_turns in complete_message_logs:
+                    user_prompt = "ERROR: User prompt not found."
+                    assistant_response = "ERROR: Assistant response not found."
+                    # Find the user and assistant content in each completed conversation
+                    for turn in conversation_turns:
+                        if turn.get("role") == "user":
+                            user_prompt = turn.get("content", "")
+                        elif turn.get("role") == "assistant":
+                            assistant_response = turn.get("content", "")
+
+                    convenient_train_inputs.append(user_prompt)
+                    convenient_train_outputs.append(assistant_response)
+
+                num_samples = len(convenient_train_inputs)
+                if num_samples > 0:
+                    # Since we now have one input for every output, we no longer need to repeat the inputs.
+                    convenient_train_log_data = {
+                        "step": [step + 1] * num_samples,
+                        "input": convenient_train_inputs,
+                        "output": convenient_train_outputs,
+                        "reward": rewards.tolist(),
+                    }
+
+                    # Log the full data
+                    logger.log_batched_dict_as_jsonl(
+                        convenient_train_log_data,
+                        f"train_data_convenient_{step + 1}.jsonl"
+                    )
+
+                    # Log the first 32 samples
+                    num_small_samples = 32
+                    first_32_log_data = {
+                        key: value[:num_small_samples] for key, value in convenient_train_log_data.items()
+                    }
+                    logger.log_batched_dict_as_jsonl(
+                        first_32_log_data,
+                        f"train_data_convenient_{step + 1}_first_32.jsonl"
+                    )
+            except Exception as e:
+                print(f"⚠️ Error logging convenient training data for step {step + 1}: {str(e)}. Continuing without convenient logging.")
+
             with timer.time("data_processing"):
                 # Add loss mask and advantages to each message in LLMMessageLogType
                 use_overlong_filtering = master_config["grpo"].get("overlong_filtering", False)
@@ -761,57 +813,6 @@ def grpo_train(
                     checkpointer.finalize_checkpoint(checkpoint_path)
                 policy.offload_after_refit()
 
-            try:
-                # Use the final `repeated_batch` which contains the complete conversations
-                # This is simpler and more robust, just like the validation logger.
-                complete_message_logs = get_keys_from_message_log(
-                    repeated_batch["message_log"], ["role", "content"]
-                )
-
-                convenient_train_inputs = []
-                convenient_train_outputs = []
-
-                for conversation_turns in complete_message_logs:
-                    user_prompt = "ERROR: User prompt not found."
-                    assistant_response = "ERROR: Assistant response not found."
-                    # Find the user and assistant content in each completed conversation
-                    for turn in conversation_turns:
-                        if turn.get("role") == "user":
-                            user_prompt = turn.get("content", "")
-                        elif turn.get("role") == "assistant":
-                            assistant_response = turn.get("content", "")
-
-                    convenient_train_inputs.append(user_prompt)
-                    convenient_train_outputs.append(assistant_response)
-
-                num_samples = len(convenient_train_inputs)
-                if num_samples > 0:
-                    # Since we now have one input for every output, we no longer need to repeat the inputs.
-                    convenient_train_log_data = {
-                        "step": [step + 1] * num_samples,
-                        "input": convenient_train_inputs,
-                        "output": convenient_train_outputs,
-                        "reward": rewards.tolist(),
-                    }
-
-                    # Log the full data
-                    logger.log_batched_dict_as_jsonl(
-                        convenient_train_log_data,
-                        f"train_data_convenient_{step + 1}.jsonl"
-                    )
-
-                    # Log the first 32 samples
-                    num_small_samples = 32
-                    first_32_log_data = {
-                        key: value[:num_small_samples] for key, value in convenient_train_log_data.items()
-                    }
-                    logger.log_batched_dict_as_jsonl(
-                        first_32_log_data,
-                        f"train_data_convenient_{step + 1}_first_32.jsonl"
-                    )
-            except Exception as e:
-                print(f"⚠️ Error logging convenient training data for step {step + 1}: {str(e)}. Continuing without convenient logging.")
-            
         # Logging
         # Log training data
         log_data = {"content": flat_messages["content"]}

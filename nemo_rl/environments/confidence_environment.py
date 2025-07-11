@@ -196,9 +196,17 @@ class ConfidenceEnvironment(BaseMathEnvironment):
 
         accuracy = (is_correct_float * batch["is_end"]).mean().item()
 
+        # New metric for accuracy on completed samples only
+        completed_samples_mask = batch["is_end"].bool()
+        if completed_samples_mask.sum() > 0:
+            accuracy_on_completed = is_correct_float[completed_samples_mask].mean().item()
+        else:
+            accuracy_on_completed = 0.0
+
         metrics = {
             "mean_reward": batch["rewards"].mean().item(),
             "accuracy": accuracy,
+            "accuracy_on_completed": accuracy_on_completed,
             "pass@samples_per_prompt": calculate_pass_rate_per_prompt(batch["text"], is_correct_float),
             "precision_of_high_confidence": precision_of_high_confidence.item(),
             

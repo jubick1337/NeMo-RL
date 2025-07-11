@@ -1,9 +1,9 @@
 import logging
 from typing import Any, Optional, TypedDict
 import re
+import traceback
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.environments.metrics import calculate_pass_rate_by_idx
 import ray
 import torch
 from math_verify.errors import TimeoutException
@@ -15,6 +15,34 @@ from nemo_rl.environments.math_environment import MathEnvConfig, BaseMathEnviron
 from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.environments.utils import chunk_list_to_workers
 
+# ===============================================================================
+# UTILITY AND HELPER FUNCTIONS
+# ===============================================================================
+
+def calculate_pass_rate_by_idx(prompt_indices: torch.Tensor, is_correct: torch.Tensor) -> float:
+    """
+    An efficient, vectorized function to compute the pass rate given prompt indices.
+    """
+    if prompt_indices.numel() == 0:
+        return 0.0
+
+    unique_indices, inverse_indices = torch.unique(prompt_indices, return_inverse=True)
+    num_unique_prompts = len(unique_indices)
+
+    if num_unique_prompts == 0:
+        return 0.0
+
+    prompt_correctness_sum = torch.zeros(num_unique_prompts, dtype=torch.int, device=is_correct.device)
+    prompt_correctness_sum.scatter_add_(0, inverse_indices, is_correct.int())
+    
+    num_passed_prompts = (prompt_correctness_sum > 0).sum().item()
+        
+    return num_passed_prompts / num_unique_prompts
+
+
+# ===============================================================================
+# CONFIDENCE ENVIRONMENT DEFINITION
+# ===============================================================================
 
 class ConfidenceEnvConfig(MathEnvConfig, total=False):
     reward_correct_high: float
@@ -159,13 +187,8 @@ class ConfidenceEnvironment(BaseMathEnvironment):
         results_nested = ray.get(futures)
         results_flat = [item for sublist in results_nested for item in sublist]
 
-        rewards_list = []
-        for i, res in enumerate(results_flat):
-            rewards_list.append(res["reward"])
-            metadata[i]["is_correct"] = res["is_correct"]
-            metadata[i]["has_format"] = res["has_format"]
-            metadata[i]["confidence_level"] = res["confidence_level"]
-
+        rewards_list = [res["reward"] for res in results_flat]
+        
         rewards = torch.tensor(rewards_list, dtype=torch.float32).cpu()
         terminateds = torch.ones_like(rewards, dtype=torch.bool).cpu()
 
@@ -182,97 +205,117 @@ class ConfidenceEnvironment(BaseMathEnvironment):
     def global_post_process_and_metrics(
         self, batch: BatchedDataDict[Any]
     ) -> tuple[BatchedDataDict[Any], dict[str, float | int]]:
-
-        # Extract the detailed results from the correct nested location
-        extra_info = batch["extra_env_info"]
-        device = batch["total_reward"].device
-
-        # Convert the lists of metadata into tensors for vectorized operations
-        is_correct_float = torch.tensor([info["is_correct"] for info in extra_info], dtype=torch.float32, device=device)
-        has_format_float = torch.tensor([info["has_format"] for info in extra_info], dtype=torch.float32, device=device)
-        confidence_level_list = [info.get("confidence_level") for info in extra_info]
-        confidence_level = torch.tensor(
-            [-1.0 if v is None else v for v in confidence_level_list],
-            dtype=torch.float32,
-            device=device
-        )
-
-        # --- Start of Metric Calculations ---
-        is_high_conf = (confidence_level == 1.0)
-        is_low_conf = (confidence_level == 0.0)
-
-        frac_correct_confident = (is_correct_float * is_high_conf).mean().item()
-        frac_correct_unconfident = (is_correct_float * is_low_conf).mean().item()
-        frac_incorrect_confident = ((1 - is_correct_float) * is_high_conf).mean().item()
-        frac_incorrect_unconfident = ((1 - is_correct_float) * is_low_conf).mean().item()
-        frac_no_confidence_found = (confidence_level == -1.0).mean().item()
-
-        if is_correct_float.sum() > 0:
-            correct_solution_generation_lengths = (
-                (batch["generation_lengths"] - batch["prompt_lengths"])[is_correct_float.bool()].float().mean().item()
-            )
-        else:
-            correct_solution_generation_lengths = 0
-
-        num_high_confidence = is_high_conf.float().sum()
-        if num_high_confidence > 0:
-            precision_of_high_confidence = (is_correct_float * is_high_conf).sum() / num_high_confidence
-        else:
-            precision_of_high_confidence = 0.0
-
-        accuracy = (is_correct_float * batch["terminated"]).mean().item()
         
-        completed_samples_mask = batch["terminated"].bool()
-        if completed_samples_mask.sum() > 0:
-            accuracy_on_completed = is_correct_float[completed_samples_mask].mean().item()
-        else:
-            accuracy_on_completed = 0.0
+        try:
+            # --- Robust Data Extraction ---
+            assistant_responses = [
+                "".join([msg["content"] for msg in convo if msg["role"] == "assistant"])
+                for convo in batch["message_log"]
+            ]
+            ground_truths = [g["ground_truth"] for g in batch["extra_env_info"]]
 
-        if "idx" in batch:
-            pass_rate = calculate_pass_rate_by_idx(batch["idx"], is_correct_float)
-        else:
-            available_keys = list(batch.keys())
-            logging.warning(
-                f"Key 'idx' not found in batch for pass_rate calculation. "
-                f"Defaulting to 0.0. Available keys: {available_keys}"
+            chunked_responses = chunk_list_to_workers(assistant_responses, self.num_workers)
+            chunked_gt = chunk_list_to_workers(ground_truths, self.num_workers)
+
+            futures = [
+                self.workers[i].verify.remote(res_chunk, gt_chunk)
+                for i, (res_chunk, gt_chunk) in enumerate(zip(chunked_responses, chunked_gt))
+            ]
+            
+            results_nested = ray.get(futures)
+            verify_results = [item for sublist in results_nested for item in sublist]
+            
+            # --- Convert Fresh Verification Results to Tensors ---
+            device = batch["total_reward"].device
+            is_correct_float = torch.tensor([res["is_correct"] for res in verify_results], dtype=torch.float32, device=device)
+            has_format_float = torch.tensor([res["has_format"] for res in verify_results], dtype=torch.float32, device=device)
+            confidence_level_list = [res.get("confidence_level") for res in verify_results]
+            confidence_level = torch.tensor(
+                [-1.0 if v is None else v for v in confidence_level_list],
+                dtype=torch.float32,
+                device=device
             )
-            pass_rate = 0.0
 
-        # --- Calculate Normalized Confidence Advantage (NCA) ---
-        num_samples = is_correct_float.shape[0]
-        num_correct = is_correct_float.sum()
-        num_incorrect = num_samples - num_correct
-        
-        # Inadequate confidence = (correct and low conf) or (incorrect and high conf)
-        num_confidence_inadequate = (is_correct_float * is_low_conf).sum() + ((1 - is_correct_float) * is_high_conf).sum()
+            # --- Start of Metric Calculations ---
+            is_high_conf = (confidence_level == 1.0)
+            is_low_conf = (confidence_level == 0.0)
 
-        norm_coefficient = torch.min(num_correct, num_incorrect)
+            frac_correct_confident = (is_correct_float * is_high_conf).mean().item()
+            frac_correct_unconfident = (is_correct_float * is_low_conf).mean().item()
+            frac_incorrect_confident = ((1 - is_correct_float) * is_high_conf).mean().item()
+            frac_incorrect_unconfident = ((1 - is_correct_float) * is_low_conf).mean().item()
+            frac_no_confidence_found = (confidence_level == -1.0).mean().item()
 
-        if norm_coefficient > 0:
-            nca = 1.0 - (num_confidence_inadequate / norm_coefficient)
-            normalized_confidence_advantage = nca.item()
-        else:
-            normalized_confidence_advantage = 0.0
+            if is_correct_float.sum() > 0:
+                correct_solution_generation_lengths = (
+                    (batch["generation_lengths"] - batch["prompt_lengths"])[is_correct_float.bool()].float().mean().item()
+                )
+            else:
+                correct_solution_generation_lengths = 0
+            
+            num_high_confidence = is_high_conf.float().sum()
+            if num_high_confidence > 0:
+                precision_of_high_confidence = (is_correct_float * is_high_conf).sum() / num_high_confidence
+            else:
+                precision_of_high_confidence = 0.0
 
-        metrics = {
-            "mean_reward": (batch["total_reward"] * batch["terminated"]).mean().item(),
-            "accuracy": accuracy,
-            "accuracy_on_completed": accuracy_on_completed,
-            "normalized_confidence_advantage": normalized_confidence_advantage,
-            "pass@samples_per_prompt": pass_rate,
-            "precision_of_high_confidence": precision_of_high_confidence.item(),
+            accuracy = (is_correct_float * batch["terminated"]).mean().item()
+            
+            completed_samples_mask = batch["terminated"].bool()
+            if completed_samples_mask.sum() > 0:
+                accuracy_on_completed = is_correct_float[completed_samples_mask].mean().item()
+            else:
+                accuracy_on_completed = 0.0
+                
+            if "idx" in batch:
+                pass_rate = calculate_pass_rate_by_idx(batch["idx"], is_correct_float)
+            else:
+                logging.warning(f"Key 'idx' not found in batch for pass_rate calculation. Defaulting to 0.0.")
+                pass_rate = 0.0
 
-            "frac_correct_confident": frac_correct_confident,
-            "frac_correct_unconfident": frac_correct_unconfident,
-            "frac_incorrect_unconfident": frac_incorrect_unconfident,
-            "frac_incorrect_confident": frac_incorrect_confident,
-            "frac_no_confidence_found": frac_no_confidence_found,
-            "frac_correct_format": has_format_float.mean().item(),
+            num_samples = is_correct_float.shape[0]
+            num_correct = is_correct_float.sum()
+            num_incorrect = num_samples - num_correct
+            
+            num_confidence_inadequate = (is_correct_float * is_low_conf).sum() + ((1 - is_correct_float) * is_high_conf).sum()
 
-            "fraction_of_samples_terminated": batch["terminated"].float().mean().item(),
-            "num_problems_in_batch": batch["terminated"].shape[0],
-            "generation_lengths": batch["generation_lengths"].float().mean().item(),
-            "prompt_lengths": batch["prompt_lengths"].float().mean().item(),
-            "correct_solution_generation_lengths": correct_solution_generation_lengths,
-        }
-        return batch, metrics
+            norm_coefficient = torch.min(num_correct, num_incorrect)
+
+            if norm_coefficient > 0:
+                nca = 1.0 - (num_confidence_inadequate / norm_coefficient)
+                normalized_confidence_advantage = nca.item()
+            else:
+                normalized_confidence_advantage = 0.0
+
+            metrics = {
+                "mean_reward": (batch["total_reward"] * batch["terminated"]).mean().item(),
+                "accuracy": accuracy,
+                "accuracy_on_completed": accuracy_on_completed,
+                "normalized_confidence_advantage": normalized_confidence_advantage,
+                "pass@samples_per_prompt": pass_rate,
+                "precision_of_high_confidence": precision_of_high_confidence.item(),
+                "frac_correct_confident": frac_correct_confident,
+                "frac_correct_unconfident": frac_correct_unconfident,
+                "frac_incorrect_unconfident": frac_incorrect_unconfident,
+                "frac_incorrect_confident": frac_incorrect_confident,
+                "frac_no_confidence_found": frac_no_confidence_found,
+                "frac_correct_format": has_format_float.mean().item(),
+                "fraction_of_samples_terminated": batch["terminated"].float().mean().item(),
+                "num_problems_in_batch": batch["terminated"].shape[0],
+                "generation_lengths": batch["generation_lengths"].float().mean().item(),
+                "prompt_lengths": batch["prompt_lengths"].float().mean().item(),
+                "correct_solution_generation_lengths": correct_solution_generation_lengths,
+            }
+            return batch, metrics
+
+        except Exception as e:
+            # Log the full error with traceback for later debugging
+            error_trace = traceback.format_exc()
+            logging.error(
+                f"!!! CRITICAL ERROR in global_post_process_and_metrics !!!\n"
+                f"Error: {e}\n"
+                f"Traceback:\n{error_trace}\n"
+                f"Skipping metrics calculation for this batch and continuing training."
+            )
+            # Return the original batch and an empty metrics dict to prevent crashing the training loop
+            return batch, {}

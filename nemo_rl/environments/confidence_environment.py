@@ -188,7 +188,7 @@ class ConfidenceEnvironment(BaseMathEnvironment):
         results_flat = [item for sublist in results_nested for item in sublist]
 
         rewards_list = [res["reward"] for res in results_flat]
-        
+
         rewards = torch.tensor(rewards_list, dtype=torch.float32).cpu()
         terminateds = torch.ones_like(rewards, dtype=torch.bool).cpu()
 
@@ -205,7 +205,7 @@ class ConfidenceEnvironment(BaseMathEnvironment):
     def global_post_process_and_metrics(
         self, batch: BatchedDataDict[Any]
     ) -> tuple[BatchedDataDict[Any], dict[str, float | int]]:
-        
+
         try:
             # --- Robust Data Extraction ---
             assistant_responses = [
@@ -221,10 +221,10 @@ class ConfidenceEnvironment(BaseMathEnvironment):
                 self.workers[i].verify.remote(res_chunk, gt_chunk)
                 for i, (res_chunk, gt_chunk) in enumerate(zip(chunked_responses, chunked_gt))
             ]
-            
+
             results_nested = ray.get(futures)
             verify_results = [item for sublist in results_nested for item in sublist]
-            
+
             # --- Convert Fresh Verification Results to Tensors ---
             device = batch["total_reward"].device
             is_correct_float = torch.tensor([res["is_correct"] for res in verify_results], dtype=torch.float32, device=device)
@@ -244,15 +244,18 @@ class ConfidenceEnvironment(BaseMathEnvironment):
             frac_correct_unconfident = (is_correct_float * is_low_conf).mean().item()
             frac_incorrect_confident = ((1 - is_correct_float) * is_high_conf).mean().item()
             frac_incorrect_unconfident = ((1 - is_correct_float) * is_low_conf).mean().item()
-            frac_no_confidence_found = (confidence_level == -1.0).mean().item()
-
-            if is_correct_float.sum() > 0:
-                correct_solution_generation_lengths = (
-                    (batch["generation_lengths"] - batch["prompt_lengths"])[is_correct_float.bool()].float().mean().item()
-                )
-            else:
-                correct_solution_generation_lengths = 0
+            frac_no_confidence_found = (confidence_level == -1.0).float().mean().item()
             
+            # Defensively calculate length-based metrics
+            correct_solution_generation_lengths = 0.0
+            if "generation_lengths" in batch and "prompt_lengths" in batch:
+                if is_correct_float.sum() > 0:
+                    correct_solution_generation_lengths = (
+                        (batch["generation_lengths"] - batch["prompt_lengths"])[is_correct_float.bool()].float().mean().item()
+                    )
+            else:
+                logging.warning("Keys 'generation_lengths' or 'prompt_lengths' not found. Skipping correct solution length metric.")
+
             num_high_confidence = is_high_conf.float().sum()
             if num_high_confidence > 0:
                 precision_of_high_confidence = (is_correct_float * is_high_conf).sum() / num_high_confidence
@@ -260,13 +263,13 @@ class ConfidenceEnvironment(BaseMathEnvironment):
                 precision_of_high_confidence = 0.0
 
             accuracy = (is_correct_float * batch["terminated"]).mean().item()
-            
+
             completed_samples_mask = batch["terminated"].bool()
             if completed_samples_mask.sum() > 0:
                 accuracy_on_completed = is_correct_float[completed_samples_mask].mean().item()
             else:
                 accuracy_on_completed = 0.0
-                
+
             if "idx" in batch:
                 pass_rate = calculate_pass_rate_by_idx(batch["idx"], is_correct_float)
             else:
@@ -276,7 +279,7 @@ class ConfidenceEnvironment(BaseMathEnvironment):
             num_samples = is_correct_float.shape[0]
             num_correct = is_correct_float.sum()
             num_incorrect = num_samples - num_correct
-            
+
             num_confidence_inadequate = (is_correct_float * is_low_conf).sum() + ((1 - is_correct_float) * is_high_conf).sum()
 
             norm_coefficient = torch.min(num_correct, num_incorrect)
@@ -302,14 +305,18 @@ class ConfidenceEnvironment(BaseMathEnvironment):
                 "frac_correct_format": has_format_float.mean().item(),
                 "fraction_of_samples_terminated": batch["terminated"].float().mean().item(),
                 "num_problems_in_batch": batch["terminated"].shape[0],
-                "generation_lengths": batch["generation_lengths"].float().mean().item(),
-                "prompt_lengths": batch["prompt_lengths"].float().mean().item(),
                 "correct_solution_generation_lengths": correct_solution_generation_lengths,
             }
+            
+            # Conditionally add length metrics if keys exist
+            if "generation_lengths" in batch:
+                metrics["generation_lengths"] = batch["generation_lengths"].float().mean().item()
+            if "prompt_lengths" in batch:
+                metrics["prompt_lengths"] = batch["prompt_lengths"].float().mean().item()
+
             return batch, metrics
 
         except Exception as e:
-            # Log the full error with traceback for later debugging
             error_trace = traceback.format_exc()
             logging.error(
                 f"!!! CRITICAL ERROR in global_post_process_and_metrics !!!\n"
@@ -317,5 +324,4 @@ class ConfidenceEnvironment(BaseMathEnvironment):
                 f"Traceback:\n{error_trace}\n"
                 f"Skipping metrics calculation for this batch and continuing training."
             )
-            # Return the original batch and an empty metrics dict to prevent crashing the training loop
             return batch, {}

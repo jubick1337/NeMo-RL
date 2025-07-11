@@ -3,7 +3,7 @@ from typing import Any, Optional, TypedDict
 import re # Import the re module
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.environments.metrics import calculate_pass_rate_by_id, calculate_pass_rate_by_idx
+from nemo_rl.environments.metrics import calculate_pass_rate_by_idx
 import ray
 import torch
 from math_verify.errors import TimeoutException

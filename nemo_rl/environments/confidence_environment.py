@@ -226,7 +226,7 @@ class ConfidenceEnvironment(BaseMathEnvironment):
             verify_results = [item for sublist in results_nested for item in sublist]
 
             # --- Convert Fresh Verification Results to Tensors ---
-            device = batch["total_reward"].device
+            device = batch["loss_multiplier"].device
             is_correct_float = torch.tensor([res["is_correct"] for res in verify_results], dtype=torch.float32, device=device)
             has_format_float = torch.tensor([res["has_format"] for res in verify_results], dtype=torch.float32, device=device)
             confidence_level_list = [res.get("confidence_level") for res in verify_results]
@@ -247,15 +247,13 @@ class ConfidenceEnvironment(BaseMathEnvironment):
             frac_incorrect_unconfident = ((1 - is_correct_float) * is_low_conf).mean().item()
             frac_no_confidence_found = (confidence_level == -1.0).float().mean().item()
 
-            # CORRECTED: Use the available length keys
             correct_solution_generation_lengths = 0.0
-            # Note: "generation_lengths" is total length, "length" is prompt length
             if "generation_lengths" in batch and "length" in batch:
                 if is_correct_float.sum() > 0:
                     correct_solution_generation_lengths = (
                         (batch["generation_lengths"] - batch["length"])[is_correct_float.bool()].float().mean().item()
                     )
-
+            
             num_high_confidence = is_high_conf.float().sum()
             if num_high_confidence > 0:
                 precision_of_high_confidence = (is_correct_float * is_high_conf).sum() / num_high_confidence
@@ -263,15 +261,17 @@ class ConfidenceEnvironment(BaseMathEnvironment):
                 precision_of_high_confidence = 0.0
 
             accuracy = (is_correct_float * valid_mask).mean().item()
-
+            
             completed_samples_mask = valid_mask.bool()
             if completed_samples_mask.sum() > 0:
                 accuracy_on_completed = is_correct_float[completed_samples_mask].mean().item()
             else:
                 accuracy_on_completed = 0.0
-
+            
+            # CORRECTED: Convert the `idx` list to a tensor before using it.
             if "idx" in batch:
-                pass_rate = calculate_pass_rate_by_idx(batch["idx"], is_correct_float)
+                idx_tensor = torch.tensor(batch["idx"], dtype=torch.long, device=device)
+                pass_rate = calculate_pass_rate_by_idx(idx_tensor, is_correct_float)
             else:
                 logging.warning(f"Key 'idx' not found in batch for pass_rate calculation. Defaulting to 0.0.")
                 pass_rate = 0.0
@@ -279,7 +279,7 @@ class ConfidenceEnvironment(BaseMathEnvironment):
             num_samples = is_correct_float.shape[0]
             num_correct = is_correct_float.sum()
             num_incorrect = num_samples - num_correct
-
+            
             num_confidence_inadequate = (is_correct_float * is_low_conf).sum() + ((1 - is_correct_float) * is_high_conf).sum()
 
             norm_coefficient = torch.min(num_correct, num_incorrect)
@@ -308,10 +308,8 @@ class ConfidenceEnvironment(BaseMathEnvironment):
                 "correct_solution_generation_lengths": correct_solution_generation_lengths,
             }
             
-            # Use correct key "length" for prompt length and rename for logging
-            if "generation_lengths" in batch:
+            if "generation_lengths" in batch and "length" in batch:
                 metrics["generation_lengths"] = batch["generation_lengths"].float().mean().item()
-            if "length" in batch:
                 metrics["prompt_lengths"] = batch["length"].float().mean().item()
 
             return batch, metrics

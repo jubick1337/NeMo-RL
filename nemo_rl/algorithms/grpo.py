@@ -599,7 +599,7 @@ def grpo_train(
                         _, env_metrics = main_env.global_post_process_and_metrics(repeated_batch)
                     else:
                         print("⚠️  Environment does not have global_post_process_and_metrics method.")
-                        
+
             # Calculate rewards & advantages
             print("▶ Processing rewards...")
             with timer.time("reward_calculation"):
@@ -750,52 +750,45 @@ def grpo_train(
                     checkpointer.finalize_checkpoint(checkpoint_path)
                 policy.offload_after_refit()
 
-            # MODIFIED: Convenient Training Logging
             try:
-                convenient_train_inputs = []
-                convenient_train_outputs = []
-                # Extract the prompt and responses from the original batch,
-                # not the repeated one, to get one entry per prompt.
-                original_message_logs = get_keys_from_message_log(
-                    batch["message_log"], ["role", "content"]
+                # Use the final `repeated_batch` which contains the complete conversations
+                # This is simpler and more robust, just like the validation logger.
+                complete_message_logs = get_keys_from_message_log(
+                    repeated_batch["message_log"], ["role", "content"]
                 )
 
-                for conversation_turns in original_message_logs:
+                convenient_train_inputs = []
+                convenient_train_outputs = []
+
+                for conversation_turns in complete_message_logs:
                     user_prompt = "ERROR: User prompt not found."
+                    assistant_response = "ERROR: Assistant response not found."
+                    # Find the user and assistant content in each completed conversation
                     for turn in conversation_turns:
                         if turn.get("role") == "user":
                             user_prompt = turn.get("content", "")
+                        elif turn.get("role") == "assistant":
+                            assistant_response = turn.get("content", "")
+
                     convenient_train_inputs.append(user_prompt)
+                    convenient_train_outputs.append(assistant_response)
 
-                # The `repeated_batch` has all the generated outputs.
-                assistant_responses = get_keys_from_message_log(
-                    repeated_batch["message_log"], ["role", "content"]
-                )
-                
-                for conv in assistant_responses:
-                     # Find the assistant response
-                    for turn in conv:
-                        if turn.get("role") == "assistant":
-                            convenient_train_outputs.append(turn.get("content", ""))
-
-                num_samples = len(convenient_train_inputs) * master_config["grpo"]["num_generations_per_prompt"]
+                num_samples = len(convenient_train_inputs)
                 if num_samples > 0:
-                    # We need to repeat inputs to match the number of outputs and rewards.
-                    repeated_inputs = np.repeat(convenient_train_inputs, master_config["grpo"]["num_generations_per_prompt"]).tolist()
-                    
+                    # Since we now have one input for every output, we no longer need to repeat the inputs.
                     convenient_train_log_data = {
                         "step": [step + 1] * num_samples,
-                        "input": repeated_inputs,
+                        "input": convenient_train_inputs,
                         "output": convenient_train_outputs,
                         "reward": rewards.tolist(),
                     }
-                    
+
                     # Log the full data
                     logger.log_batched_dict_as_jsonl(
                         convenient_train_log_data,
                         f"train_data_convenient_{step + 1}.jsonl"
                     )
-                    
+
                     # Log the first 32 samples
                     num_small_samples = 32
                     first_32_log_data = {
@@ -807,7 +800,6 @@ def grpo_train(
                     )
             except Exception as e:
                 print(f"⚠️ Error logging convenient training data for step {step + 1}: {str(e)}. Continuing without convenient logging.")
-            # END MODIFICATION
             
         # Logging
         # Log training data

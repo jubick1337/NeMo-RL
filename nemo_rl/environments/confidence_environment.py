@@ -3,7 +3,7 @@ from typing import Any, Optional, TypedDict
 import re # Import the re module
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.environments.metrics import calculate_pass_rate_per_prompt
+from nemo_rl.environments.metrics import calculate_pass_rate_per_prompt, calculate_pass_rate_by_idx
 import ray
 import torch
 from math_verify.errors import TimeoutException
@@ -19,7 +19,7 @@ class ConfidenceEnvConfig(MathEnvConfig, total=False):
     reward_incorrect_low: float
     reward_incorrect_confident: float
     reward_no_confidence: float
-    reward_for_format: float
+    reward_for_format: float # NEW
 
 @ray.remote
 class HFVerifyWorkerConfidence:
@@ -40,7 +40,6 @@ class HFVerifyWorkerConfidence:
                 LatexExtractionConfig(),
             ),
         )
-        # Store all reward values
         self.reward_correct_high = reward_correct_high
         self.reward_correct_low = reward_correct_low
         self.reward_incorrect_low = reward_incorrect_low
@@ -159,24 +158,17 @@ class ConfidenceEnvironment(BaseMathEnvironment):
     ) -> tuple[BatchedDataDict[Any], dict[str, float | int]]:
         original_rewards = batch["total_reward"].clone()
 
-        # To calculate the base metrics, we must first determine if the format bonus was applied.
-        # A response has the correct format if its reward is `reward_for_format` higher than a base reward.
         has_correct_format = (original_rewards == self.reward_correct_high + self.reward_for_format) | \
                              (original_rewards == self.reward_correct_low + self.reward_for_format) | \
                              (original_rewards == self.reward_incorrect_low + self.reward_for_format) | \
                              (original_rewards == self.reward_incorrect_confident + self.reward_for_format) | \
                              (original_rewards == self.reward_no_confidence + self.reward_for_format)
         
-        # Now, calculate the base reward by subtracting the format bonus where it was applied.
         base_reward = original_rewards.clone()
         base_reward[has_correct_format] -= self.reward_for_format
-
-        # --- Calculate all metrics using the `base_reward` ---
         
         is_correct = (base_reward == self.reward_correct_high) | (base_reward == self.reward_correct_low)
         is_correct_float = is_correct.float()
-
-        batch["total_reward"] = batch["total_reward"] * batch["is_end"]
         
         if is_correct_float.sum() > 0:
             correct_solution_generation_lengths = (
@@ -192,45 +184,48 @@ class ConfidenceEnvironment(BaseMathEnvironment):
         else:
             precision_of_high_confidence = 0.0
 
-        # Accuracy across the entire batch, where non-ended samples are treated as incorrect.
-        accuracy = (is_correct_float * batch["is_end"]).mean().item()
+        accuracy = (is_correct_float * batch["terminated"]).mean().item()
 
-        # Accuracy on completed samples only
-        completed_samples_mask = batch["is_end"].bool()
+        completed_samples_mask = batch["terminated"].bool()
         if completed_samples_mask.sum() > 0:
             accuracy_on_completed = is_correct_float[completed_samples_mask].mean().item()
         else:
             accuracy_on_completed = 0.0
+            
+        # Calculate pass rate using the new vectorized function by prompt index
+        if "idx" in batch:
+            pass_rate = calculate_pass_rate_by_idx(batch["idx"], is_correct_float)
+        else:
+            available_keys = list(batch.keys())
+            logging.warning(
+                f"Key 'idx' not found in batch for pass_rate calculation. "
+                f"Defaulting to 0.0. Available keys: {available_keys}"
+            )
+            pass_rate = 0.0
 
         # --- Calculate Normalized Confidence Advantage (NCA) ---
-        # NCA = 1 - (num_inadequate_confidence / min(num_correct, num_incorrect))
-        # "Inadequate" confidence means the model was correct but had low confidence, or incorrect but had high confidence.
         num_samples = is_correct_float.shape[0]
         num_correct = is_correct_float.sum()
         num_incorrect = num_samples - num_correct
 
-        # Find samples with inadequate confidence
         is_correct_low_conf = (base_reward == self.reward_correct_low)
         is_incorrect_high_conf = (base_reward == self.reward_incorrect_confident)
         num_confidence_inadequate = (is_correct_low_conf | is_incorrect_high_conf).float().sum()
 
-        # The normalization coefficient is the size of the smaller class (correct vs incorrect)
         norm_coefficient = torch.min(num_correct, num_incorrect)
 
         if norm_coefficient > 0:
             nca = 1.0 - (num_confidence_inadequate / norm_coefficient)
             normalized_confidence_advantage = nca.item()
         else:
-            # If a class is empty (all correct or all incorrect), the metric is undefined. Default to 0.
             normalized_confidence_advantage = 0.0
 
-
         metrics = {
-            "mean_reward": batch["total_reward"].mean().item(),
+            "mean_reward": (batch["total_reward"] * batch["terminated"]).mean().item(),
             "accuracy": accuracy,
             "accuracy_on_completed": accuracy_on_completed,
             "normalized_confidence_advantage": normalized_confidence_advantage,
-            "pass@samples_per_prompt": calculate_pass_rate_per_prompt(batch["text"], is_correct_float),
+            "pass@samples_per_prompt": pass_rate,
             "precision_of_high_confidence": precision_of_high_confidence.item(),
             
             "frac_correct_confident": (base_reward == self.reward_correct_high).float().mean().item(),
@@ -240,8 +235,8 @@ class ConfidenceEnvironment(BaseMathEnvironment):
             "frac_no_confidence_found": (base_reward == self.reward_no_confidence).float().mean().item(),
             "frac_correct_format": has_correct_format.float().mean().item(),
             
-            "fraction_of_samples_properly_ended": batch["is_end"].float().mean().item(),
-            "num_problems_in_batch": batch["is_end"].shape[0],
+            "fraction_of_samples_terminated": batch["terminated"].float().mean().item(),
+            "num_problems_in_batch": batch["terminated"].shape[0],
             "generation_lengths": batch["generation_lengths"].float().mean().item(),
             "prompt_lengths": batch["prompt_lengths"].float().mean().item(),
             "correct_solution_generation_lengths": correct_solution_generation_lengths,

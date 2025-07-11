@@ -473,6 +473,9 @@ def run_multi_turn_rollout(
     # Add total rewards to the final batch
     current_batch["total_reward"] = total_rewards
 
+    # Add the per-sample truncation flags to the batch
+    current_batch["truncated"] = sample_truncated
+
     current_batch["min_reward"] = total_rewards.min().item()
     current_batch["max_reward"] = total_rewards.max().item()
     current_batch["mean_reward"] = total_rewards.mean().item()
@@ -819,6 +822,7 @@ def run_async_multi_turn_rollout(
                 "total_reward": torch.stack(
                     [state["total_reward"] for state in final_sample_states]
                 ),
+                "truncated": torch.tensor([m["truncated"] for m in all_sample_metrics], dtype=torch.bool),
                 "idx": [
                     state.get("idx", i) for i, state in enumerate(final_sample_states)
                 ],

@@ -78,6 +78,7 @@ class GRPOConfig(TypedDict):
     max_rollout_turns: int
     normalize_rewards: bool
     use_leave_one_out_baseline: bool
+    overlong_filtering: bool
     val_period: int
     val_batch_size: int
     val_at_start: bool
@@ -629,16 +630,23 @@ def grpo_train(
 
             with timer.time("data_processing"):
                 # Add loss mask and advantages to each message in LLMMessageLogType
+                use_overlong_filtering = master_config["grpo"].get("overlong_filtering", False)
+
                 for i, message_log in enumerate(repeated_batch["message_log"]):
+                    # Check if the sample was truncated and if the filtering strategy is enabled
+                    is_filtered = use_overlong_filtering and repeated_batch.get("truncated", [False] * repeated_batch.size)[i]
+
                     for j, message in enumerate(message_log):
                         if message["role"] == "assistant":
-                            message["token_loss_mask"] = torch.ones_like(
-                                message["token_ids"]
-                            )
+                            # If the sample is filtered, its loss mask is all zeros.
+                            # Otherwise, the loss mask is all ones.
+                            if is_filtered:
+                                message["token_loss_mask"] = torch.zeros_like(message["token_ids"])
+                            else:
+                                message["token_loss_mask"] = torch.ones_like(message["token_ids"])
                         else:
-                            message["token_loss_mask"] = torch.zeros_like(
-                                message["token_ids"]
-                            )
+                            message["token_loss_mask"] = torch.zeros_like(message["token_ids"])
+
                         if "generation_logprobs" not in message:
                             message["generation_logprobs"] = torch.zeros_like(
                                 message["token_ids"], dtype=torch.float32

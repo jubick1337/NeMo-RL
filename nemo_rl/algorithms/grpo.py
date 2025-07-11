@@ -545,6 +545,9 @@ def grpo_train(
                     repeated_batch["message_log"],
                     pad_value_dict={"token_ids": tokenizer.pad_token_id},
                 )
+                
+                repeated_batch["generation_lengths"] = input_lengths
+
                 input_ids = batched_flat["token_ids"]
 
             # Generate responses - this updates the LLMMessageLogType in repeated_batch

@@ -237,6 +237,7 @@ class ConfidenceEnvironment(BaseMathEnvironment):
             )
 
             # --- Start of Metric Calculations ---
+            valid_mask = batch["loss_multiplier"]
             is_high_conf = (confidence_level == 1.0)
             is_low_conf = (confidence_level == 0.0)
 
@@ -245,16 +246,15 @@ class ConfidenceEnvironment(BaseMathEnvironment):
             frac_incorrect_confident = ((1 - is_correct_float) * is_high_conf).mean().item()
             frac_incorrect_unconfident = ((1 - is_correct_float) * is_low_conf).mean().item()
             frac_no_confidence_found = (confidence_level == -1.0).float().mean().item()
-            
-            # Defensively calculate length-based metrics
+
+            # CORRECTED: Use the available length keys
             correct_solution_generation_lengths = 0.0
-            if "generation_lengths" in batch and "prompt_lengths" in batch:
+            # Note: "generation_lengths" is total length, "length" is prompt length
+            if "generation_lengths" in batch and "length" in batch:
                 if is_correct_float.sum() > 0:
                     correct_solution_generation_lengths = (
-                        (batch["generation_lengths"] - batch["prompt_lengths"])[is_correct_float.bool()].float().mean().item()
+                        (batch["generation_lengths"] - batch["length"])[is_correct_float.bool()].float().mean().item()
                     )
-            else:
-                logging.warning("Keys 'generation_lengths' or 'prompt_lengths' not found. Skipping correct solution length metric.")
 
             num_high_confidence = is_high_conf.float().sum()
             if num_high_confidence > 0:
@@ -262,9 +262,9 @@ class ConfidenceEnvironment(BaseMathEnvironment):
             else:
                 precision_of_high_confidence = 0.0
 
-            accuracy = (is_correct_float * batch["terminated"]).mean().item()
+            accuracy = (is_correct_float * valid_mask).mean().item()
 
-            completed_samples_mask = batch["terminated"].bool()
+            completed_samples_mask = valid_mask.bool()
             if completed_samples_mask.sum() > 0:
                 accuracy_on_completed = is_correct_float[completed_samples_mask].mean().item()
             else:
@@ -291,7 +291,7 @@ class ConfidenceEnvironment(BaseMathEnvironment):
                 normalized_confidence_advantage = 0.0
 
             metrics = {
-                "mean_reward": (batch["total_reward"] * batch["terminated"]).mean().item(),
+                "mean_reward": (batch["total_reward"] * valid_mask).mean().item(),
                 "accuracy": accuracy,
                 "accuracy_on_completed": accuracy_on_completed,
                 "normalized_confidence_advantage": normalized_confidence_advantage,
@@ -303,16 +303,16 @@ class ConfidenceEnvironment(BaseMathEnvironment):
                 "frac_incorrect_confident": frac_incorrect_confident,
                 "frac_no_confidence_found": frac_no_confidence_found,
                 "frac_correct_format": has_format_float.mean().item(),
-                "fraction_of_samples_terminated": batch["terminated"].float().mean().item(),
-                "num_problems_in_batch": batch["terminated"].shape[0],
+                "fraction_of_samples_valid": valid_mask.float().mean().item(),
+                "num_problems_in_batch": valid_mask.shape[0],
                 "correct_solution_generation_lengths": correct_solution_generation_lengths,
             }
             
-            # Conditionally add length metrics if keys exist
+            # Use correct key "length" for prompt length and rename for logging
             if "generation_lengths" in batch:
                 metrics["generation_lengths"] = batch["generation_lengths"].float().mean().item()
-            if "prompt_lengths" in batch:
-                metrics["prompt_lengths"] = batch["prompt_lengths"].float().mean().item()
+            if "length" in batch:
+                metrics["prompt_lengths"] = batch["length"].float().mean().item()
 
             return batch, metrics
 

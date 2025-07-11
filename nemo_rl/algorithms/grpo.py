@@ -469,8 +469,6 @@ def refit_policy_generation(
 # ===============================================================================
 # Training & Validation
 # ===============================================================================
-
-
 def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -591,6 +589,17 @@ def grpo_train(
                     )
                 policy_generation.finish_generation()
 
+            print("▶ Calculating environment metrics...")
+            env_metrics = {}
+            with timer.time("env_metrics_calculation"):
+                if task_to_env:
+                    # Get an environment instance from the dictionary
+                    main_env = next(iter(task_to_env.values()))
+                    if hasattr(main_env, "global_post_process_and_metrics"):
+                        _, env_metrics = main_env.global_post_process_and_metrics(repeated_batch)
+                    else:
+                        print("⚠️  Environment does not have global_post_process_and_metrics method.")
+                        
             # Calculate rewards & advantages
             print("▶ Processing rewards...")
             with timer.time("reward_calculation"):
@@ -823,9 +832,12 @@ def grpo_train(
                 metrics[k] = np.sum(v).item()
         metrics.update(rollout_metrics)
 
+        # Add the detailed metrics from the environment to the log
+        metrics.update(env_metrics)
+
         timing_metrics: dict[str, float] = timer.get_timing_metrics(reduction_op="sum")  # type: ignore
         # track example with high token mult prob error above 1.05
-        if metrics["token_mult_prob_error"] > 1.05:
+        if metrics.get("token_mult_prob_error", 0) > 1.05:
             logger.log_plot_token_mult_prob_error(
                 {
                     "prompt_lengths": repeated_batch["length"],
@@ -841,10 +853,10 @@ def grpo_train(
 
         print("\n📊 Training Results:")
 
-        print(f"  • Loss: {metrics['loss']:.4f}")
+        print(f"  • Loss: {metrics.get('loss', 0):.4f}")
         print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
         print(
-            f"  • Mean Generation Length: {rollout_metrics['mean_gen_tokens_per_sample']:.4f}"
+            f"  • Mean Generation Length: {rollout_metrics.get('mean_gen_tokens_per_sample', 0):.4f}"
         )
 
         print("\n⏱️  Timing:")

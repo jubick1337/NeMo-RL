@@ -596,7 +596,7 @@ def grpo_train(
                     # Get an environment instance from the dictionary
                     main_env = next(iter(task_to_env.values()))
                     if hasattr(main_env, "global_post_process_and_metrics"):
-                        _, env_metrics = main_env.global_post_process_and_metrics(repeated_batch)
+                        _, env_metrics = ray.get(main_env.global_post_process_and_metrics.remote(repeated_batch))
                     else:
                         print("⚠️  Environment does not have global_post_process_and_metrics method.")
 

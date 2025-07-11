@@ -13,14 +13,13 @@ from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 from nemo_rl.environments.math_environment import MathEnvConfig, BaseMathEnvironment, _mute_output
 
-# MODIFIED: Add a new parameter for the format reward
 class ConfidenceEnvConfig(MathEnvConfig, total=False):
     reward_correct_high: float
     reward_correct_low: float
     reward_incorrect_low: float
     reward_incorrect_confident: float
     reward_no_confidence: float
-    reward_for_format: float # NEW
+    reward_for_format: float
 
 @ray.remote
 class HFVerifyWorkerConfidence:
@@ -31,7 +30,6 @@ class HFVerifyWorkerConfidence:
         reward_incorrect_low: float = 0.0,
         reward_incorrect_confident: float = -1.0,
         reward_no_confidence: float = -2.0,
-        # MODIFIED: Default the format reward to 0.0
         reward_for_format: float = 0.0,
     ) -> None:
         logging.getLogger("math_verify").setLevel(logging.CRITICAL)
@@ -48,7 +46,7 @@ class HFVerifyWorkerConfidence:
         self.reward_incorrect_low = reward_incorrect_low
         self.reward_incorrect_confident = reward_incorrect_confident
         self.reward_no_confidence = reward_no_confidence
-        self.reward_for_format = reward_for_format # NEW
+        self.reward_for_format = reward_for_format
 
     def check_response_format(self, response: str) -> int:
         """
@@ -194,19 +192,44 @@ class ConfidenceEnvironment(BaseMathEnvironment):
         else:
             precision_of_high_confidence = 0.0
 
+        # Accuracy across the entire batch, where non-ended samples are treated as incorrect.
         accuracy = (is_correct_float * batch["is_end"]).mean().item()
 
-        # New metric for accuracy on completed samples only
+        # Accuracy on completed samples only
         completed_samples_mask = batch["is_end"].bool()
         if completed_samples_mask.sum() > 0:
             accuracy_on_completed = is_correct_float[completed_samples_mask].mean().item()
         else:
             accuracy_on_completed = 0.0
 
+        # --- Calculate Normalized Confidence Advantage (NCA) ---
+        # NCA = 1 - (num_inadequate_confidence / min(num_correct, num_incorrect))
+        # "Inadequate" confidence means the model was correct but had low confidence, or incorrect but had high confidence.
+        num_samples = is_correct_float.shape[0]
+        num_correct = is_correct_float.sum()
+        num_incorrect = num_samples - num_correct
+
+        # Find samples with inadequate confidence
+        is_correct_low_conf = (base_reward == self.reward_correct_low)
+        is_incorrect_high_conf = (base_reward == self.reward_incorrect_confident)
+        num_confidence_inadequate = (is_correct_low_conf | is_incorrect_high_conf).float().sum()
+
+        # The normalization coefficient is the size of the smaller class (correct vs incorrect)
+        norm_coefficient = torch.min(num_correct, num_incorrect)
+
+        if norm_coefficient > 0:
+            nca = 1.0 - (num_confidence_inadequate / norm_coefficient)
+            normalized_confidence_advantage = nca.item()
+        else:
+            # If a class is empty (all correct or all incorrect), the metric is undefined. Default to 0.
+            normalized_confidence_advantage = 0.0
+
+
         metrics = {
             "mean_reward": batch["rewards"].mean().item(),
             "accuracy": accuracy,
             "accuracy_on_completed": accuracy_on_completed,
+            "normalized_confidence_advantage": normalized_confidence_advantage,
             "pass@samples_per_prompt": calculate_pass_rate_per_prompt(batch["text"], is_correct_float),
             "precision_of_high_confidence": precision_of_high_confidence.item(),
             
@@ -215,7 +238,7 @@ class ConfidenceEnvironment(BaseMathEnvironment):
             "frac_incorrect_unconfident": (base_reward == self.reward_incorrect_low).float().mean().item(),
             "frac_incorrect_confident": (base_reward == self.reward_incorrect_confident).float().mean().item(),
             "frac_no_confidence_found": (base_reward == self.reward_no_confidence).float().mean().item(),
-            "frac_correct_format": has_correct_format.float().mean().item(), # NEW metric
+            "frac_correct_format": has_correct_format.float().mean().item(),
             
             "fraction_of_samples_properly_ended": batch["is_end"].float().mean().item(),
             "num_problems_in_batch": batch["is_end"].shape[0],

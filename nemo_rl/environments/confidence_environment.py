@@ -157,7 +157,7 @@ class ConfidenceEnvironment(BaseMathEnvironment):
     def global_post_process_and_metrics(
         self, batch: BatchedDataDict[Any]
     ) -> tuple[BatchedDataDict[Any], dict[str, float | int]]:
-        original_rewards = batch["rewards"].clone()
+        original_rewards = batch["total_reward"].clone()
 
         # To calculate the base metrics, we must first determine if the format bonus was applied.
         # A response has the correct format if its reward is `reward_for_format` higher than a base reward.
@@ -176,7 +176,7 @@ class ConfidenceEnvironment(BaseMathEnvironment):
         is_correct = (base_reward == self.reward_correct_high) | (base_reward == self.reward_correct_low)
         is_correct_float = is_correct.float()
 
-        batch["rewards"] = batch["rewards"] * batch["is_end"]
+        batch["total_reward"] = batch["total_reward"] * batch["is_end"]
         
         if is_correct_float.sum() > 0:
             correct_solution_generation_lengths = (
@@ -226,7 +226,7 @@ class ConfidenceEnvironment(BaseMathEnvironment):
 
 
         metrics = {
-            "mean_reward": batch["rewards"].mean().item(),
+            "mean_reward": batch["total_reward"].mean().item(),
             "accuracy": accuracy,
             "accuracy_on_completed": accuracy_on_completed,
             "normalized_confidence_advantage": normalized_confidence_advantage,

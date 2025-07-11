@@ -1,6 +1,6 @@
 import logging
 from typing import Any, Optional, TypedDict
-import re # Import the re module
+import re
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.metrics import calculate_pass_rate_by_idx
@@ -11,8 +11,7 @@ from math_verify.metric import math_metric
 from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
 
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
-# Import the base environment and its original worker
-from nemo_rl.environments.math_environment import MathEnvConfig, BaseMathEnvironment, HFVerifyWorker, _mute_output
+from nemo_rl.environments.math_environment import MathEnvConfig, BaseMathEnvironment, _mute_output
 from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.environments.utils import chunk_list_to_workers
 
@@ -78,12 +77,8 @@ class HFVerifyWorkerConfidence:
             return None
 
     def verify(self, pred_responses: list[str], ground_truths: list[str]) -> list[ConfidenceVerifyResult]:
-        """
-        Verify correctness and format, then return a structured dictionary.
-        """
         results: list[ConfidenceVerifyResult] = []
         for response, ground_truth in zip(pred_responses, ground_truths):
-            # 1. Check for correctness
             is_correct = False
             try:
                 last_boxed_idx = response.rfind("\\boxed{")
@@ -98,11 +93,9 @@ class HFVerifyWorkerConfidence:
             except Exception:
                 is_correct = False
 
-            # 2. Check for confidence and format
             confidence_level = self.parse_confidence(response)
             has_format = self.check_response_format(response)
 
-            # 3. Calculate base reward
             final_reward = 0.0
             if is_correct:
                 if confidence_level == 1.0:
@@ -118,8 +111,7 @@ class HFVerifyWorkerConfidence:
                     final_reward = self.reward_incorrect_confident
                 else:
                     final_reward = self.reward_no_confidence
-            
-            # 4. Conditionally add format reward
+
             if self.reward_for_format != 0 and has_format:
                 final_reward += self.reward_for_format
 
@@ -131,11 +123,10 @@ class HFVerifyWorkerConfidence:
             })
         return results
 
+
 @ray.remote(max_restarts=-1, max_task_retries=-1)
 class ConfidenceEnvironment(BaseMathEnvironment):
     def __init__(self, config: ConfidenceEnvConfig) -> None:
-        # We call the BaseMathEnvironment's init, but we will immediately
-        # replace its generic workers with our specialized confidence workers.
         super().__init__(config)
         reward_config = {
             "reward_correct_high": config.get("reward_correct_high", 2.0),
@@ -149,17 +140,8 @@ class ConfidenceEnvironment(BaseMathEnvironment):
             HFVerifyWorkerConfidence.options(runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}).remote(**reward_config)
             for _ in range(self.num_workers)
         ]
-        # Store reward values for metric calculation
-        self.reward_correct_high = reward_config["reward_correct_high"]
-        self.reward_correct_low = reward_config["reward_correct_low"]
-        self.reward_incorrect_low = reward_config["reward_incorrect_low"]
-        self.reward_incorrect_confident = reward_config["reward_incorrect_confident"]
-        self.reward_no_confidence = reward_config["reward_no_confidence"]
 
-    def step(self, message_log_batch: list[list[dict[str, str]]], metadata: list[dict[str,Any]]) -> EnvironmentReturn:
-        """
-        An overridden step method to handle the structured output from HFVerifyWorkerConfidence.
-        """
+    def step(self, message_log_batch: list[list[dict[str, str]]], metadata: list[dict[str, Any]]) -> EnvironmentReturn:
         assistant_response_batch = [
             "".join([msg["content"] for msg in convo if msg["role"] == "assistant"])
             for convo in message_log_batch
@@ -173,25 +155,20 @@ class ConfidenceEnvironment(BaseMathEnvironment):
             self.workers[i].verify.remote(res_chunk, gt_chunk)
             for i, (res_chunk, gt_chunk) in enumerate(zip(chunked_responses, chunked_gt))
         ]
-        
-        # results will be a list of lists of dictionaries
+
         results_nested = ray.get(futures)
-        # Flatten the list
         results_flat = [item for sublist in results_nested for item in sublist]
 
-        # Extract data for EnvironmentReturn and add extra info to metadata
         rewards_list = []
         for i, res in enumerate(results_flat):
             rewards_list.append(res["reward"])
-            # Add the explicit, reliable flags to the metadata for this sample
             metadata[i]["is_correct"] = res["is_correct"]
             metadata[i]["has_format"] = res["has_format"]
             metadata[i]["confidence_level"] = res["confidence_level"]
 
         rewards = torch.tensor(rewards_list, dtype=torch.float32).cpu()
         terminateds = torch.ones_like(rewards, dtype=torch.bool).cpu()
-        
-        # The observation is less important in this single-turn setup
+
         observations = [{"role": "environment", "content": f"Reward: {r.item()}"} for r in rewards]
 
         return EnvironmentReturn(
@@ -205,19 +182,30 @@ class ConfidenceEnvironment(BaseMathEnvironment):
     def global_post_process_and_metrics(
         self, batch: BatchedDataDict[Any]
     ) -> tuple[BatchedDataDict[Any], dict[str, float | int]]:
-        is_correct_float = batch["is_correct"].float()
-        has_format_float = batch["has_format"].float()
-        confidence_level = batch["confidence_level"]
 
-        # Reconstruct base_reward reliably for frac_* metrics if needed
+        # Extract the detailed results from the correct nested location
+        extra_info = batch["extra_env_info"]
+        device = batch["total_reward"].device
+
+        # Convert the lists of metadata into tensors for vectorized operations
+        is_correct_float = torch.tensor([info["is_correct"] for info in extra_info], dtype=torch.float32, device=device)
+        has_format_float = torch.tensor([info["has_format"] for info in extra_info], dtype=torch.float32, device=device)
+        confidence_level_list = [info.get("confidence_level") for info in extra_info]
+        confidence_level = torch.tensor(
+            [-1.0 if v is None else v for v in confidence_level_list],
+            dtype=torch.float32,
+            device=device
+        )
+
+        # --- Start of Metric Calculations ---
         is_high_conf = (confidence_level == 1.0)
         is_low_conf = (confidence_level == 0.0)
-        
+
         frac_correct_confident = (is_correct_float * is_high_conf).mean().item()
         frac_correct_unconfident = (is_correct_float * is_low_conf).mean().item()
         frac_incorrect_confident = ((1 - is_correct_float) * is_high_conf).mean().item()
         frac_incorrect_unconfident = ((1 - is_correct_float) * is_low_conf).mean().item()
-        frac_no_confidence_found = (confidence_level == -1.0).float().mean().item() # Assuming None becomes -1
+        frac_no_confidence_found = (confidence_level == -1.0).mean().item()
 
         if is_correct_float.sum() > 0:
             correct_solution_generation_lengths = (
@@ -225,7 +213,7 @@ class ConfidenceEnvironment(BaseMathEnvironment):
             )
         else:
             correct_solution_generation_lengths = 0
-        
+
         num_high_confidence = is_high_conf.float().sum()
         if num_high_confidence > 0:
             precision_of_high_confidence = (is_correct_float * is_high_conf).sum() / num_high_confidence
@@ -233,17 +221,21 @@ class ConfidenceEnvironment(BaseMathEnvironment):
             precision_of_high_confidence = 0.0
 
         accuracy = (is_correct_float * batch["terminated"]).mean().item()
-
+        
         completed_samples_mask = batch["terminated"].bool()
         if completed_samples_mask.sum() > 0:
             accuracy_on_completed = is_correct_float[completed_samples_mask].mean().item()
         else:
             accuracy_on_completed = 0.0
-            
+
         if "idx" in batch:
             pass_rate = calculate_pass_rate_by_idx(batch["idx"], is_correct_float)
         else:
-            logging.warning(f"Key 'idx' not found in batch for pass_rate calculation. Defaulting to 0.0.")
+            available_keys = list(batch.keys())
+            logging.warning(
+                f"Key 'idx' not found in batch for pass_rate calculation. "
+                f"Defaulting to 0.0. Available keys: {available_keys}"
+            )
             pass_rate = 0.0
 
         # --- Calculate Normalized Confidence Advantage (NCA) ---
@@ -251,7 +243,8 @@ class ConfidenceEnvironment(BaseMathEnvironment):
         num_correct = is_correct_float.sum()
         num_incorrect = num_samples - num_correct
         
-        num_confidence_inadequate = (frac_correct_unconfident + frac_incorrect_confident) * num_samples
+        # Inadequate confidence = (correct and low conf) or (incorrect and high conf)
+        num_confidence_inadequate = (is_correct_float * is_low_conf).sum() + ((1 - is_correct_float) * is_high_conf).sum()
 
         norm_coefficient = torch.min(num_correct, num_incorrect)
 
@@ -268,14 +261,14 @@ class ConfidenceEnvironment(BaseMathEnvironment):
             "normalized_confidence_advantage": normalized_confidence_advantage,
             "pass@samples_per_prompt": pass_rate,
             "precision_of_high_confidence": precision_of_high_confidence.item(),
-            
+
             "frac_correct_confident": frac_correct_confident,
             "frac_correct_unconfident": frac_correct_unconfident,
             "frac_incorrect_unconfident": frac_incorrect_unconfident,
             "frac_incorrect_confident": frac_incorrect_confident,
             "frac_no_confidence_found": frac_no_confidence_found,
             "frac_correct_format": has_format_float.mean().item(),
-            
+
             "fraction_of_samples_terminated": batch["terminated"].float().mean().item(),
             "num_problems_in_batch": batch["terminated"].shape[0],
             "generation_lengths": batch["generation_lengths"].float().mean().item(),

@@ -34,3 +34,31 @@ def calculate_pass_rate_per_prompt(
             correct_prompt_ct += 1
 
     return correct_prompt_ct / len(unique_prompts)
+
+
+def calculate_pass_rate_by_idx(prompt_indices: torch.Tensor, is_correct: torch.Tensor) -> float:
+    """
+    An efficient, vectorized function to compute the pass rate given prompt indices.
+
+    Args:
+        prompt_indices (torch.Tensor): A 1D tensor of indices for each prompt.
+        is_correct (torch.Tensor): A 1D boolean tensor indicating correctness.
+
+    Returns:
+        float: The pass rate.
+    """
+    if prompt_indices.numel() == 0:
+        return 0.0
+
+    unique_indices, inverse_indices = torch.unique(prompt_indices, return_inverse=True)
+    num_unique_prompts = len(unique_indices)
+
+    if num_unique_prompts == 0:
+        return 0.0
+
+    prompt_correctness_sum = torch.zeros(num_unique_prompts, dtype=torch.int, device=is_correct.device)
+    prompt_correctness_sum.scatter_add_(0, inverse_indices, is_correct.int())
+    
+    num_passed_prompts = (prompt_correctness_sum > 0).sum().item()
+        
+    return num_passed_prompts / num_unique_prompts if num_unique_prompts > 0 else 0.0

@@ -548,7 +548,6 @@ def grpo_train(
                 )
                 
                 repeated_batch["generation_lengths"] = input_lengths
-
                 input_ids = batched_flat["token_ids"]
 
             # Generate responses - this updates the LLMMessageLogType in repeated_batch
@@ -593,20 +592,27 @@ def grpo_train(
                     )
                 policy_generation.finish_generation()
             
-            # MODIFIED: Removed the call to global_post_process_and_metrics as requested.
-            # This entire block is now disabled to avoid the performance bottleneck and data flow issues.
-            #
-            # print("▶ Calculating environment metrics...")
-            # env_metrics = {}
-            # with timer.time("env_metrics_calculation"):
-            #     if task_to_env:
-            #         # Get an environment instance from the dictionary
-            #         main_env = next(iter(task_to_env.values()))
-            #         if hasattr(main_env, "global_post_process_and_metrics"):
-            #             _, env_metrics = ray.get(main_env.global_post_process_and_metrics.remote(repeated_batch))
-            #         else:
-            #             print("⚠️  Environment does not have global_post_process_and_metrics method.")
-            env_metrics = {} # Ensure env_metrics is an empty dict
+            # Calculate environment metrics
+            print("▶ Calculating environment metrics...")
+            env_metrics = {}
+            with timer.time("env_metrics_calculation"):
+                if task_to_env:
+                    main_env = next(iter(task_to_env.values()))
+                    if hasattr(main_env, "global_post_process_and_metrics"):
+                        # Create a lightweight batch with only the necessary data for metrics
+                        metrics_batch = BatchedDataDict({
+                            "total_reward": repeated_batch["total_reward"],
+                            "loss_multiplier": repeated_batch["loss_multiplier"],
+                            "extra_env_info": repeated_batch["extra_env_info"],
+                            "generation_lengths": repeated_batch["generation_lengths"],
+                            "prompt_lengths": repeated_batch["length"],
+                            "prompt_ids": repeated_batch["idx"],
+                        })
+                        # Send only the small, relevant batch, not the whole repeated_batch
+                        _, env_metrics = ray.get(main_env.global_post_process_and_metrics.remote(metrics_batch))
+                    else:
+                        print("⚠️  Environment does not have global_post_process_and_metrics method.")
+
 
             # Calculate rewards & advantages
             print("▶ Processing rewards...")
@@ -632,7 +638,7 @@ def grpo_train(
                         advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
                     )
 
-
+            # Convenient Logging (remains unchanged)
             try:
                 complete_message_logs = [
                     get_keys_from_message_log(log, ["role", "content"])
@@ -730,7 +736,7 @@ def grpo_train(
                         "sample_mask": repeated_batch["loss_multiplier"],
                     }
                 )
-                train_data.to("cpu")
+                # This is the line that was removed, as it was a typo and redundant.
 
             print("▶ Preparing for logprob inference...")
             with timer.time("logprob_inference_prep"):
@@ -790,7 +796,6 @@ def grpo_train(
             ):  # +1 because step is 0-indexed
                 policy.prepare_for_training()
 
-                # val_metrics will only be defined on validation steps, handle this
                 val_reward_for_ckpt = val_metrics["accuracy"] if val_metrics else grpo_save_state["val_reward"]
                 grpo_save_state["step"] = step + 1
                 grpo_save_state["val_reward"] = val_reward_for_ckpt
@@ -817,7 +822,6 @@ def grpo_train(
                 policy.offload_after_refit()
 
         # Logging
-        # Log training data
         log_data = {"content": flat_messages["content"]}
         log_data["rewards"] = rewards.tolist()
         log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
@@ -838,12 +842,9 @@ def grpo_train(
             else:
                 metrics[k] = np.sum(v).item()
         metrics.update(rollout_metrics)
-
-        # MODIFIED: Removed metrics.update(env_metrics) as it is now always empty
-        # metrics.update(env_metrics)
+        metrics.update(env_metrics)
 
         timing_metrics: dict[str, float] = timer.get_timing_metrics(reduction_op="sum")  # type: ignore
-        # track example with high token mult prob error above 1.05
         if metrics.get("token_mult_prob_error", 0) > 1.05:
             logger.log_plot_token_mult_prob_error(
                 {
@@ -867,11 +868,8 @@ def grpo_train(
         )
 
         print("\n⏱️  Timing:")
-        # Display total time first, separately
         total_time = timing_metrics.get("total_step_time", 0)
         print(f"  • Total step time: {total_time:.2f}s")
-
-        # Display all other timing metrics
         for k, v in sorted(
             timing_metrics.items(), key=lambda item: item[1], reverse=True
         ):

@@ -1,25 +1,46 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import logging
-from typing import Any, Optional, TypedDict
 import re
 import traceback
+from typing import Any, Optional, TypedDict
 
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 import ray
 import torch
 from math_verify.errors import TimeoutException
 from math_verify.metric import math_metric
 from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
 
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
-from nemo_rl.environments.math_environment import MathEnvConfig, BaseMathEnvironment, _mute_output
 from nemo_rl.environments.interfaces import EnvironmentReturn
+from nemo_rl.environments.math_environment import (
+    BaseMathEnvironment,
+    MathEnvConfig,
+    _mute_output,
+)
 from nemo_rl.environments.utils import chunk_list_to_workers
 
 # ===============================================================================
 # UTILITY AND HELPER FUNCTIONS
 # ===============================================================================
 
-def calculate_pass_rate_by_idx(prompt_indices: torch.Tensor, is_correct: torch.Tensor) -> float:
+
+def calculate_pass_rate_by_idx(
+    prompt_indices: torch.Tensor, is_correct: torch.Tensor
+) -> float:
     """
     An efficient, vectorized function to compute the pass rate given prompt indices.
     """
@@ -32,17 +53,20 @@ def calculate_pass_rate_by_idx(prompt_indices: torch.Tensor, is_correct: torch.T
     if num_unique_prompts == 0:
         return 0.0
 
-    prompt_correctness_sum = torch.zeros(num_unique_prompts, dtype=torch.int, device=is_correct.device)
+    prompt_correctness_sum = torch.zeros(
+        num_unique_prompts, dtype=torch.int, device=is_correct.device
+    )
     prompt_correctness_sum.scatter_add_(0, inverse_indices, is_correct.int())
-    
+
     num_passed_prompts = (prompt_correctness_sum > 0).sum().item()
-        
+
     return num_passed_prompts / num_unique_prompts
 
 
 # ===============================================================================
 # CONFIDENCE ENVIRONMENT DEFINITION
 # ===============================================================================
+
 
 class ConfidenceEnvConfig(MathEnvConfig, total=False):
     reward_correct_high: float
@@ -51,6 +75,7 @@ class ConfidenceEnvConfig(MathEnvConfig, total=False):
     reward_incorrect_confident: float
     reward_no_confidence: float
     reward_for_format: float
+
 
 class ConfidenceVerifyResult(TypedDict):
     reward: float
@@ -73,7 +98,10 @@ class HFVerifyWorkerConfidence:
         logging.getLogger("math_verify").setLevel(logging.CRITICAL)
         self.verify_func = math_metric(
             gold_extraction_target=(LatexExtractionConfig(),),
-            pred_extraction_target=(ExprExtractionConfig(), LatexExtractionConfig(),),
+            pred_extraction_target=(
+                ExprExtractionConfig(),
+                LatexExtractionConfig(),
+            ),
         )
         self.reward_correct_high = reward_correct_high
         self.reward_correct_low = reward_correct_low
@@ -101,21 +129,29 @@ class HFVerifyWorkerConfidence:
                 return 0.0
             return None
         except Exception as e:
-            logging.error(f"Error parsing confidence from response: {response}. Error: {e}")
+            logging.error(
+                f"Error parsing confidence from response: {response}. Error: {e}"
+            )
             return None
 
-    def verify(self, pred_responses: list[str], ground_truths: list[str]) -> list[ConfidenceVerifyResult]:
+    def verify(
+        self, pred_responses: list[str], ground_truths: list[str]
+    ) -> list[ConfidenceVerifyResult]:
         results: list[ConfidenceVerifyResult] = []
         for response, ground_truth in zip(pred_responses, ground_truths):
             is_correct = False
             try:
                 last_boxed_idx = response.rfind("\\boxed{")
-                response_to_verify = response[last_boxed_idx:] if last_boxed_idx != -1 else response
+                response_to_verify = (
+                    response[last_boxed_idx:] if last_boxed_idx != -1 else response
+                )
                 ground_truth_parsable = "\\boxed{" + ground_truth + "}"
                 with _mute_output():
                     try:
-                        ret_score, _ = self.verify_func([ground_truth_parsable], [response_to_verify])
-                        is_correct = (float(ret_score) == 1.0)
+                        ret_score, _ = self.verify_func(
+                            [ground_truth_parsable], [response_to_verify]
+                        )
+                        is_correct = float(ret_score) == 1.0
                     except (Exception, TimeoutException):
                         is_correct = False
             except Exception:
@@ -143,12 +179,14 @@ class HFVerifyWorkerConfidence:
             if self.reward_for_format != 0 and has_format:
                 final_reward += self.reward_for_format
 
-            results.append({
-                "reward": final_reward,
-                "is_correct": is_correct,
-                "has_format": has_format,
-                "confidence_level": confidence_level,
-            })
+            results.append(
+                {
+                    "reward": final_reward,
+                    "is_correct": is_correct,
+                    "has_format": has_format,
+                    "confidence_level": confidence_level,
+                }
+            )
         return results
 
 
@@ -165,18 +203,26 @@ class ConfidenceEnvironment(BaseMathEnvironment):
             "reward_for_format": config.get("reward_for_format", 0.0),
         }
         self.workers = [
-            HFVerifyWorkerConfidence.options(runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}).remote(**reward_config)
+            HFVerifyWorkerConfidence.options(
+                runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}
+            ).remote(**reward_config)
             for _ in range(self.num_workers)
         ]
 
-    def step(self, message_log_batch: list[list[dict[str, str]]], metadata: list[dict[str, Any]]) -> EnvironmentReturn:
+    def step(
+        self,
+        message_log_batch: list[list[dict[str, str]]],
+        metadata: list[dict[str, Any]],
+    ) -> EnvironmentReturn:
         assistant_response_batch = [
             "".join([msg["content"] for msg in convo if msg["role"] == "assistant"])
             for convo in message_log_batch
         ]
         ground_truths = [g["ground_truth"] for g in metadata]
 
-        chunked_responses = chunk_list_to_workers(assistant_response_batch, self.num_workers)
+        chunked_responses = chunk_list_to_workers(
+            assistant_response_batch, self.num_workers
+        )
         chunked_gt = chunk_list_to_workers(ground_truths, self.num_workers)
 
         futures = [
@@ -188,20 +234,23 @@ class ConfidenceEnvironment(BaseMathEnvironment):
         results_flat = [item for sublist in results_nested for item in sublist]
 
         rewards_list = []
-        # Attach the full verification results to the metadata.
-        # The modified grpo.py will now correctly propagate this back.
+        # MODIFIED: Attach the full verification results to the metadata.
+        # This is the key change to propagate the data forward.
         for i, res in enumerate(results_flat):
             rewards_list.append(res["reward"])
-            metadata[i]["verification_result"] = res
+            if "verification_result" not in metadata[i]:
+                 metadata[i]["verification_result"] = res
 
         rewards = torch.tensor(rewards_list, dtype=torch.float32).cpu()
         terminateds = torch.ones_like(rewards, dtype=torch.bool).cpu()
 
-        observations = [{"role": "environment", "content": f"Reward: {r.item()}"} for r in rewards]
+        observations = [
+            {"role": "environment", "content": f"Reward: {r.item()}"} for r in rewards
+        ]
 
         return EnvironmentReturn(
             observations=observations,
-            metadata=metadata,
+            metadata=metadata,  # The metadata now contains our precious verification results
             next_stop_strings=[None] * len(message_log_batch),
             rewards=rewards,
             terminateds=terminateds,
@@ -210,28 +259,35 @@ class ConfidenceEnvironment(BaseMathEnvironment):
     def global_post_process_and_metrics(
         self, batch: BatchedDataDict[Any]
     ) -> tuple[BatchedDataDict[Any], dict[str, float | int]]:
-
         try:
             # --- EFFICIENT DATA EXTRACTION ---
-            # This now reads the pre-computed results that were propagated back
-            # by the modified grpo.py, avoiding the need to re-verify.
+            # This now reads the pre-computed results that were propagated from the `step` method.
+            # No network call or re-verification is needed!
             verify_results = [info["verification_result"] for info in batch["extra_env_info"]]
 
             # --- Convert Pre-computed Verification Results to Tensors ---
             device = batch["loss_multiplier"].device
-            is_correct_float = torch.tensor([res["is_correct"] for res in verify_results], dtype=torch.float32, device=device)
-            has_format_float = torch.tensor([res["has_format"] for res in verify_results], dtype=torch.float32, device=device)
+            is_correct_float = torch.tensor(
+                [res["is_correct"] for res in verify_results],
+                dtype=torch.float32,
+                device=device,
+            )
+            has_format_float = torch.tensor(
+                [res["has_format"] for res in verify_results],
+                dtype=torch.float32,
+                device=device,
+            )
             confidence_level_list = [res.get("confidence_level") for res in verify_results]
             confidence_level = torch.tensor(
                 [-1.0 if v is None else v for v in confidence_level_list],
                 dtype=torch.float32,
-                device=device
+                device=device,
             )
 
             # --- Start of Metric Calculations ---
             valid_mask = batch["loss_multiplier"]
-            is_high_conf = (confidence_level == 1.0)
-            is_low_conf = (confidence_level == 0.0)
+            is_high_conf = confidence_level == 1.0
+            is_low_conf = confidence_level == 0.0
 
             frac_correct_confident = (is_correct_float * is_high_conf).mean().item()
             frac_correct_unconfident = (is_correct_float * is_low_conf).mean().item()
@@ -240,31 +296,47 @@ class ConfidenceEnvironment(BaseMathEnvironment):
             frac_no_confidence_found = (confidence_level == -1.0).float().mean().item()
 
             correct_solution_generation_lengths = 0.0
-            if "generation_lengths" in batch and "length" in batch:
+            if "generation_lengths" in batch and "prompt_lengths" in batch:
                 if is_correct_float.sum() > 0:
                     correct_solution_generation_lengths = (
-                        (batch["generation_lengths"] - batch["length"])[is_correct_float.bool()].float().mean().item()
+                        (batch["generation_lengths"] - batch["prompt_lengths"])[
+                            is_correct_float.bool()
+                        ]
+                        .float()
+                        .mean()
+                        .item()
                     )
 
             num_high_confidence = is_high_conf.float().sum()
-            precision_of_high_confidence = (is_correct_float * is_high_conf).sum() / num_high_confidence if num_high_confidence > 0 else torch.tensor(0.0)
-            
+            precision_of_high_confidence = (
+                (is_correct_float * is_high_conf).sum() / num_high_confidence
+                if num_high_confidence > 0
+                else torch.tensor(0.0)
+            )
+
             accuracy = (is_correct_float * valid_mask).mean().item()
 
             completed_samples_mask = valid_mask.bool()
-            accuracy_on_completed = is_correct_float[completed_samples_mask].mean().item() if completed_samples_mask.sum() > 0 else 0.0
+            accuracy_on_completed = (
+                is_correct_float[completed_samples_mask].mean().item()
+                if completed_samples_mask.sum() > 0
+                else 0.0
+            )
 
-            if "idx" in batch:
-                idx_tensor = torch.tensor(batch["idx"], dtype=torch.long, device=device)
-                pass_rate = calculate_pass_rate_by_idx(idx_tensor, is_correct_float)
+            if "prompt_ids" in batch:
+                pass_rate = calculate_pass_rate_by_idx(batch["prompt_ids"], is_correct_float)
             else:
-                logging.warning(f"Key 'idx' not found in batch for pass_rate calculation. Defaulting to 0.0.")
+                logging.warning(
+                    "Key 'prompt_ids' not found in batch for pass_rate calculation. Defaulting to 0.0."
+                )
                 pass_rate = 0.0
 
             num_samples = is_correct_float.shape[0]
             num_correct = is_correct_float.sum()
             num_incorrect = num_samples - num_correct
-            num_confidence_inadequate = (is_correct_float * is_low_conf).sum() + ((1 - is_correct_float) * is_high_conf).sum()
+            num_confidence_inadequate = (is_correct_float * is_low_conf).sum() + (
+                (1 - is_correct_float) * is_high_conf
+            ).sum()
             norm_coefficient = torch.min(num_correct, num_incorrect)
 
             if norm_coefficient > 0:
@@ -291,18 +363,18 @@ class ConfidenceEnvironment(BaseMathEnvironment):
                 "correct_solution_generation_lengths": correct_solution_generation_lengths,
             }
 
-            if "generation_lengths" in batch and "length" in batch:
+            if "generation_lengths" in batch and "prompt_lengths" in batch:
                 metrics["generation_lengths"] = batch["generation_lengths"].float().mean().item()
-                metrics["prompt_lengths"] = batch["length"].float().mean().item()
+                metrics["prompt_lengths"] = batch["prompt_lengths"].float().mean().item()
 
             return batch, metrics
 
         except Exception as e:
             error_trace = traceback.format_exc()
             logging.error(
-                f"!!! CRITICAL ERROR in global_post_process_and_metrics !!!\n"
+                "!!! CRITICAL ERROR in global_post_process_and_metrics !!!\n"
                 f"Error: {e}\n"
                 f"Traceback:\n{error_trace}\n"
-                f"Skipping metrics calculation for this batch and continuing training."
+                "Skipping metrics calculation for this batch and continuing training."
             )
             return batch, {}

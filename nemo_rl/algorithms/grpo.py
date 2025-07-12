@@ -580,7 +580,6 @@ def grpo_train(
                         greedy=False,
                     )
                 else:
-                    # MODIFIED: This function now correctly updates repeated_batch["extra_env_info"]
                     repeated_batch, rollout_metrics = run_multi_turn_rollout(
                         policy_generation=policy_generation,
                         input_batch=repeated_batch,
@@ -593,18 +592,21 @@ def grpo_train(
                         greedy=False,
                     )
                 policy_generation.finish_generation()
-
-            print("▶ Calculating environment metrics...")
-            env_metrics = {}
-            with timer.time("env_metrics_calculation"):
-                if task_to_env:
-                    # Get an environment instance from the dictionary
-                    main_env = next(iter(task_to_env.values()))
-                    if hasattr(main_env, "global_post_process_and_metrics"):
-                        # This call is now much faster as it doesn't re-run verification
-                        _, env_metrics = ray.get(main_env.global_post_process_and_metrics.remote(repeated_batch))
-                    else:
-                        print("⚠️  Environment does not have global_post_process_and_metrics method.")
+            
+            # MODIFIED: Removed the call to global_post_process_and_metrics as requested.
+            # This entire block is now disabled to avoid the performance bottleneck and data flow issues.
+            #
+            # print("▶ Calculating environment metrics...")
+            # env_metrics = {}
+            # with timer.time("env_metrics_calculation"):
+            #     if task_to_env:
+            #         # Get an environment instance from the dictionary
+            #         main_env = next(iter(task_to_env.values()))
+            #         if hasattr(main_env, "global_post_process_and_metrics"):
+            #             _, env_metrics = ray.get(main_env.global_post_process_and_metrics.remote(repeated_batch))
+            #         else:
+            #             print("⚠️  Environment does not have global_post_process_and_metrics method.")
+            env_metrics = {} # Ensure env_metrics is an empty dict
 
             # Calculate rewards & advantages
             print("▶ Processing rewards...")
@@ -838,8 +840,8 @@ def grpo_train(
                 metrics[k] = np.sum(v).item()
         metrics.update(rollout_metrics)
 
-        # Add the detailed metrics from the environment to the log
-        metrics.update(env_metrics)
+        # MODIFIED: Removed metrics.update(env_metrics) as it is now always empty
+        # metrics.update(env_metrics)
 
         timing_metrics: dict[str, float] = timer.get_timing_metrics(reduction_op="sum")  # type: ignore
         # track example with high token mult prob error above 1.05
@@ -919,7 +921,6 @@ def validate(
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
             # Use async rollouts if vLLM async engine is enabled
             if _should_use_async_rollouts(master_config):
-                # MODIFIED: Ensure metadata is propagated correctly in async rollouts too
                 val_batch, gen_metrics = run_async_multi_turn_rollout(
                     policy_generation,
                     val_batch,
@@ -930,7 +931,6 @@ def validate(
                     greedy=False,
                 )
             else:
-                # MODIFIED: Ensure metadata is propagated correctly
                 val_batch, gen_metrics = run_multi_turn_rollout(
                     policy_generation,
                     val_batch,

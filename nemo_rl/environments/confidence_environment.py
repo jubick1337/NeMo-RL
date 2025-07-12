@@ -187,7 +187,12 @@ class ConfidenceEnvironment(BaseMathEnvironment):
         results_nested = ray.get(futures)
         results_flat = [item for sublist in results_nested for item in sublist]
 
-        rewards_list = [res["reward"] for res in results_flat]
+        rewards_list = []
+        # OPTIMIZED: Store the full verification results in the metadata during the initial step.
+        # This avoids re-calculating everything later in global_post_process_and_metrics.
+        for i, res in enumerate(results_flat):
+            rewards_list.append(res["reward"])
+            metadata[i]["verification_result"] = res
 
         rewards = torch.tensor(rewards_list, dtype=torch.float32).cpu()
         terminateds = torch.ones_like(rewards, dtype=torch.bool).cpu()
@@ -207,25 +212,12 @@ class ConfidenceEnvironment(BaseMathEnvironment):
     ) -> tuple[BatchedDataDict[Any], dict[str, float | int]]:
 
         try:
-            # --- Robust Data Extraction ---
-            assistant_responses = [
-                "".join([msg["content"] for msg in convo if msg["role"] == "assistant"])
-                for convo in batch["message_log"]
-            ]
-            ground_truths = [g["ground_truth"] for g in batch["extra_env_info"]]
+            # --- EFFICIENT DATA EXTRACTION ---
+            # The expensive verification is no longer run here. Instead, we directly
+            # extract the results that were pre-computed and stored in the `step` method.
+            verify_results = [info["verification_result"] for info in batch["extra_env_info"]]
 
-            chunked_responses = chunk_list_to_workers(assistant_responses, self.num_workers)
-            chunked_gt = chunk_list_to_workers(ground_truths, self.num_workers)
-
-            futures = [
-                self.workers[i].verify.remote(res_chunk, gt_chunk)
-                for i, (res_chunk, gt_chunk) in enumerate(zip(chunked_responses, chunked_gt))
-            ]
-
-            results_nested = ray.get(futures)
-            verify_results = [item for sublist in results_nested for item in sublist]
-
-            # --- Convert Fresh Verification Results to Tensors ---
+            # --- Convert Pre-computed Verification Results to Tensors ---
             device = batch["loss_multiplier"].device
             is_correct_float = torch.tensor([res["is_correct"] for res in verify_results], dtype=torch.float32, device=device)
             has_format_float = torch.tensor([res["has_format"] for res in verify_results], dtype=torch.float32, device=device)
@@ -268,7 +260,6 @@ class ConfidenceEnvironment(BaseMathEnvironment):
             else:
                 accuracy_on_completed = 0.0
 
-            # CORRECTED: Convert the `idx` list to a tensor before using it.
             if "idx" in batch:
                 # Convert the list to a tensor
                 idx_tensor = torch.tensor(batch["idx"], dtype=torch.long, device=device)

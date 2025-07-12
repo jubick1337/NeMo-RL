@@ -2,7 +2,6 @@ import logging
 from typing import Any, Optional, TypedDict
 import re
 import traceback
-import time # Added for timing
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 import ray
@@ -187,13 +186,9 @@ class ConfidenceEnvironment(BaseMathEnvironment):
 
         results_nested = ray.get(futures)
         results_flat = [item for sublist in results_nested for item in sublist]
-
-        rewards_list = []
-        # OPTIMIZED: Store the full verification results in the metadata during the initial step.
-        # This avoids re-calculating everything later in global_post_process_and_metrics.
-        for i, res in enumerate(results_flat):
-            rewards_list.append(res["reward"])
-            metadata[i]["verification_result"] = res
+        
+        # The step method ONLY returns rewards. The detailed metrics are calculated later.
+        rewards_list = [res["reward"] for res in results_flat]
 
         rewards = torch.tensor(rewards_list, dtype=torch.float32).cpu()
         terminateds = torch.ones_like(rewards, dtype=torch.bool).cpu()
@@ -202,7 +197,7 @@ class ConfidenceEnvironment(BaseMathEnvironment):
 
         return EnvironmentReturn(
             observations=observations,
-            metadata=metadata,
+            metadata=metadata, # Pass the original, unmodified metadata back
             next_stop_strings=[None] * len(message_log_batch),
             rewards=rewards,
             terminateds=terminateds,
@@ -211,18 +206,29 @@ class ConfidenceEnvironment(BaseMathEnvironment):
     def global_post_process_and_metrics(
         self, batch: BatchedDataDict[Any]
     ) -> tuple[BatchedDataDict[Any], dict[str, float | int]]:
-        
-        # ADDED: Start timer and logging
-        start_time = time.monotonic()
-        logging.info("DEVLOG: Starting global_post_process_and_metrics...")
 
         try:
-            verify_results = [info["verification_result"] for info in batch["extra_env_info"]]
-            
-            # ADDED: Logging
-            after_extraction_time = time.monotonic()
-            logging.info(f"DEVLOG: ... data extraction took {after_extraction_time - start_time:.4f} seconds.")
+            # --- Robust Data Extraction and Re-verification ---
+            # This is the original, robust implementation that fixes the KeyError.
+            # It re-runs verification on the final batch data.
+            assistant_responses = [
+                "".join([msg["content"] for msg in convo if msg["role"] == "assistant"])
+                for convo in batch["message_log"]
+            ]
+            ground_truths = [g["ground_truth"] for g in batch["extra_env_info"]]
 
+            chunked_responses = chunk_list_to_workers(assistant_responses, self.num_workers)
+            chunked_gt = chunk_list_to_workers(ground_truths, self.num_workers)
+
+            futures = [
+                self.workers[i].verify.remote(res_chunk, gt_chunk)
+                for i, (res_chunk, gt_chunk) in enumerate(zip(chunked_responses, chunked_gt))
+            ]
+
+            results_nested = ray.get(futures)
+            verify_results = [item for sublist in results_nested for item in sublist]
+
+            # --- Convert Fresh Verification Results to Tensors ---
             device = batch["loss_multiplier"].device
             is_correct_float = torch.tensor([res["is_correct"] for res in verify_results], dtype=torch.float32, device=device)
             has_format_float = torch.tensor([res["has_format"] for res in verify_results], dtype=torch.float32, device=device)
@@ -233,10 +239,7 @@ class ConfidenceEnvironment(BaseMathEnvironment):
                 device=device
             )
 
-            # ADDED: Logging
-            after_tensor_conv_time = time.monotonic()
-            logging.info(f"DEVLOG: ... tensor conversion took {after_tensor_conv_time - after_extraction_time:.4f} seconds.")
-
+            # --- Start of Metric Calculations ---
             valid_mask = batch["loss_multiplier"]
             is_high_conf = (confidence_level == 1.0)
             is_low_conf = (confidence_level == 0.0)
@@ -255,18 +258,11 @@ class ConfidenceEnvironment(BaseMathEnvironment):
                     )
 
             num_high_confidence = is_high_conf.float().sum()
-            if num_high_confidence > 0:
-                precision_of_high_confidence = (is_correct_float * is_high_conf).sum() / num_high_confidence
-            else:
-                precision_of_high_confidence = 0.0
-
+            precision_of_high_confidence = (is_correct_float * is_high_conf).sum() / num_high_confidence if num_high_confidence > 0 else torch.tensor(0.0)
             accuracy = (is_correct_float * valid_mask).mean().item()
 
             completed_samples_mask = valid_mask.bool()
-            if completed_samples_mask.sum() > 0:
-                accuracy_on_completed = is_correct_float[completed_samples_mask].mean().item()
-            else:
-                accuracy_on_completed = 0.0
+            accuracy_on_completed = is_correct_float[completed_samples_mask].mean().item() if completed_samples_mask.sum() > 0 else 0.0
 
             if "idx" in batch:
                 idx_tensor = torch.tensor(batch["idx"], dtype=torch.long, device=device)
@@ -308,11 +304,6 @@ class ConfidenceEnvironment(BaseMathEnvironment):
             if "generation_lengths" in batch and "length" in batch:
                 metrics["generation_lengths"] = batch["generation_lengths"].float().mean().item()
                 metrics["prompt_lengths"] = batch["length"].float().mean().item()
-                
-            # ADDED: Logging
-            after_metrics_calc_time = time.monotonic()
-            logging.info(f"DEVLOG: ... metrics calculation took {after_metrics_calc_time - after_tensor_conv_time:.4f} seconds.")
-            logging.info(f"DEVLOG: Finished global_post_process_and_metrics. Total time: {after_metrics_calc_time - start_time:.4f} seconds.")
 
             return batch, metrics
 

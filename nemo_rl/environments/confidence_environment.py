@@ -234,12 +234,13 @@ class ConfidenceEnvironment(BaseMathEnvironment):
         results_flat = [item for sublist in results_nested for item in sublist]
 
         rewards_list = []
-        # MODIFIED: Attach the full verification results to the metadata.
+        # Attach the full verification results to the metadata.
         # This is the key change to propagate the data forward.
         for i, res in enumerate(results_flat):
             rewards_list.append(res["reward"])
-            if "verification_result" not in metadata[i]:
-                 metadata[i]["verification_result"] = res
+            # Ensure metadata at index i exists and is a dict before modification
+            if i < len(metadata) and isinstance(metadata[i], dict):
+                metadata[i]["verification_result"] = res
 
         rewards = torch.tensor(rewards_list, dtype=torch.float32).cpu()
         terminateds = torch.ones_like(rewards, dtype=torch.bool).cpu()
@@ -262,7 +263,6 @@ class ConfidenceEnvironment(BaseMathEnvironment):
         try:
             # --- EFFICIENT DATA EXTRACTION ---
             # This now reads the pre-computed results that were propagated from the `step` method.
-            # No network call or re-verification is needed!
             verify_results = [info["verification_result"] for info in batch["extra_env_info"]]
 
             # --- Convert Pre-computed Verification Results to Tensors ---

@@ -400,6 +400,14 @@ def run_multi_turn_rollout(
 
         total_rewards[active_indices] += env_output.rewards
 
+        # <<< START OF MODIFICATION >>>
+        # Update metadata (extra_env_info) for ALL active samples with the new info from the environment.
+        # This is the critical fix to ensure terminated samples also get their final verification result.
+        for i, global_idx in enumerate(active_indices.tolist()):
+            if env_output.metadata[i] is not None:
+                current_batch["extra_env_info"][global_idx] = env_output.metadata[i]
+        # <<< END OF MODIFICATION >>>
+
         # Update message log for ALL active samples with env observation
         # This must happen BEFORE filtering based on done flags
         truncation_mask = torch.zeros_like(env_output.terminateds, dtype=torch.bool)
@@ -451,21 +459,14 @@ def run_multi_turn_rollout(
         active_indices_local_next = torch.where(~done)[0]
         active_indices = active_indices[active_indices_local_next]
         continuing_indices_global = active_indices  # Indices relative to original batch
-        # Get next stop strings and infos corresponding to the indices that are *continuing*
+        # Get next stop strings corresponding to the indices that are *continuing*
         continuing_next_stops = [
             env_output.next_stop_strings[i] for i in active_indices_local_next.tolist()
         ]
-        # Get metadata corresponding to continuing indices, using the correct field name
-        continuing_metadata = [
-            env_output.metadata[i] for i in active_indices_local_next.tolist()
-        ]
 
+        # Update the stop strings for only the continuing samples
         for i, global_idx in enumerate(continuing_indices_global.tolist()):
-            # Update stop strings for the next turn
             current_stop_strings[global_idx] = continuing_next_stops[i]
-            # Update metadata (extra_env_info) using info from environment
-            if continuing_metadata[i] is not None:
-                current_batch["extra_env_info"][global_idx] = continuing_metadata[i]
 
     # Record samples that reached max turns
     sample_max_turns_reached[active_indices] = True
@@ -502,7 +503,6 @@ def run_multi_turn_rollout(
         ),
     }
     return current_batch, rollout_metrics
-
 
 async def async_generate_response_for_sample_turn(
     policy_generation: GenerationInterface,

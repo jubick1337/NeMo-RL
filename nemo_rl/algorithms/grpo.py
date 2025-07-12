@@ -546,7 +546,7 @@ def grpo_train(
                     repeated_batch["message_log"],
                     pad_value_dict={"token_ids": tokenizer.pad_token_id},
                 )
-                
+
                 repeated_batch["generation_lengths"] = input_lengths
                 input_ids = batched_flat["token_ids"]
 
@@ -591,7 +591,7 @@ def grpo_train(
                         greedy=False,
                     )
                 policy_generation.finish_generation()
-            
+
             # Calculate environment metrics
             print("▶ Calculating environment metrics...")
             env_metrics = {}
@@ -603,7 +603,7 @@ def grpo_train(
                         metrics_batch = BatchedDataDict({
                             "total_reward": repeated_batch["total_reward"],
                             "loss_multiplier": repeated_batch["loss_multiplier"],
-                            "extra_env_info": repeated_batch["extra_env_info"],
+                            "extra_env_info": repeated_batch["extra_env_info"], 
                             "generation_lengths": repeated_batch["generation_lengths"],
                             "prompt_lengths": repeated_batch["length"],
                             "prompt_ids": repeated_batch["idx"],
@@ -638,7 +638,7 @@ def grpo_train(
                         advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
                     )
 
-            # Convenient Logging (remains unchanged)
+            # Convenient Logging
             try:
                 complete_message_logs = [
                     get_keys_from_message_log(log, ["role", "content"])
@@ -663,7 +663,6 @@ def grpo_train(
 
                 num_samples = len(convenient_train_inputs)
                 if num_samples > 0:
-                    # Since we now have one input for every output, we no longer need to repeat the inputs.
                     convenient_train_log_data = {
                         "step": [step + 1] * num_samples,
                         "input": convenient_train_inputs,
@@ -671,13 +670,11 @@ def grpo_train(
                         "reward": rewards.tolist(),
                     }
 
-                    # Log the full data
                     logger.log_batched_dict_as_jsonl(
                         convenient_train_log_data,
                         f"train_data_convenient_{step + 1}.jsonl"
                     )
 
-                    # Log the first 32 samples
                     num_small_samples = 32
                     first_32_log_data = {
                         key: value[:num_small_samples] for key, value in convenient_train_log_data.items()
@@ -690,17 +687,13 @@ def grpo_train(
                 print(f"⚠️ Error logging convenient training data for step {step + 1}: {str(e)}. Continuing without convenient logging.")
 
             with timer.time("data_processing"):
-                # Add loss mask and advantages to each message in LLMMessageLogType
                 use_overlong_filtering = master_config["grpo"].get("overlong_filtering", False)
 
                 for i, message_log in enumerate(repeated_batch["message_log"]):
-                    # Check if the sample was truncated and if the filtering strategy is enabled
                     is_filtered = use_overlong_filtering and repeated_batch.get("truncated", [False] * repeated_batch.size)[i]
 
                     for j, message in enumerate(message_log):
                         if message["role"] == "assistant":
-                            # If the sample is filtered, its loss mask is all zeros.
-                            # Otherwise, the loss mask is all ones.
                             if is_filtered:
                                 message["token_loss_mask"] = torch.zeros_like(message["token_ids"])
                             else:
@@ -716,7 +709,6 @@ def grpo_train(
                             message["token_ids"].shape
                         )
 
-                # Convert updated LLMMessageLogType to FlatMessagesType for training
                 flat_messages, input_lengths = batched_message_log_to_flat_message(
                     repeated_batch["message_log"],
                     pad_value_dict={"token_ids": tokenizer.pad_token_id},
@@ -725,7 +717,6 @@ def grpo_train(
                     ],
                 )
 
-                # Create training data from flattened messages
                 train_data = BatchedDataDict[ClippedPGLossDataDict](
                     {
                         "input_ids": flat_messages["token_ids"],
@@ -736,7 +727,6 @@ def grpo_train(
                         "sample_mask": repeated_batch["loss_multiplier"],
                     }
                 )
-                # This is the line that was removed, as it was a typo and redundant.
 
             print("▶ Preparing for logprob inference...")
             with timer.time("logprob_inference_prep"):
@@ -753,7 +743,7 @@ def grpo_train(
 
             print("▶ Preparing for training...")
             with timer.time("training_prep"):
-                policy.prepare_for_training()  # set model train and reload optim to GPU
+                policy.prepare_for_training()
                 POLICY_GENERATION_STALE = True
 
             print("▶ Training policy...")
@@ -764,7 +754,6 @@ def grpo_train(
                 master_config["grpo"]["max_num_steps"], len(dataloader)
             )
 
-            # Run validation if it's a validation step
             if is_last_step or (val_period > 0 and (step + 1) % val_period == 0):
                 if NEED_REFIT and POLICY_GENERATION_STALE:
                     refit_policy_generation(
@@ -780,7 +769,7 @@ def grpo_train(
                     val_task_to_env,
                     step=step + 1,
                     master_config=master_config,
-                    logger=logger,  # Pass the logger object
+                    logger=logger,
                 )
                 policy_generation.finish_generation()
                 logger.log_metrics(
@@ -788,12 +777,11 @@ def grpo_train(
                 )
                 logger.log_metrics(val_metrics, step + 1, prefix="validation")
 
-            ## Checkpointing
             consumed_samples += master_config["grpo"]["num_prompts_per_step"]
             if master_config["checkpointing"]["enabled"] and (
                 is_last_step
                 or (step + 1) % master_config["checkpointing"]["save_period"] == 0
-            ):  # +1 because step is 0-indexed
+            ):
                 policy.prepare_for_training()
 
                 val_reward_for_ckpt = val_metrics["accuracy"] if val_metrics else grpo_save_state["val_reward"]
@@ -844,7 +832,7 @@ def grpo_train(
         metrics.update(rollout_metrics)
         metrics.update(env_metrics)
 
-        timing_metrics: dict[str, float] = timer.get_timing_metrics(reduction_op="sum")  # type: ignore
+        timing_metrics: dict[str, float] = timer.get_timing_metrics(reduction_op="sum")
         if metrics.get("token_mult_prob_error", 0) > 1.05:
             logger.log_plot_token_mult_prob_error(
                 {
@@ -860,7 +848,6 @@ def grpo_train(
             )
 
         print("\n📊 Training Results:")
-
         print(f"  • Loss: {metrics.get('loss', 0):.4f}")
         print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
         print(

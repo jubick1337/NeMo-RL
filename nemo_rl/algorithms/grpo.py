@@ -882,18 +882,25 @@ def validate(
     logger: Logger,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run validation on the validation dataset."""
-    if val_dataloader is None:
-        print("  ⚠️ No validation dataloader provided, skipping validation")
+    if val_dataloader is None or not val_task_to_env:
+        print("  ⚠️ No validation dataloader or environment provided, skipping validation")
         return {}, {}
+
+    main_env = next(iter(val_task_to_env.values()))
+    has_global_metrics = hasattr(main_env, "global_post_process_and_metrics")
 
     timer = Timer()
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...")
 
-        total_rewards = []
-        total_lengths = []
-        all_message_logs = []  # This will store all generated conversations
-
+        # ADDED: Initialize lists to collect data across all validation batches
+        all_rewards = []
+        all_gen_lengths = []
+        all_prompt_lengths = []
+        all_prompt_ids = []
+        all_extra_env_info = []
+        all_loss_multipliers = []
+        
         max_batches = (
             master_config["grpo"]["max_val_samples"]
             // master_config["grpo"]["val_batch_size"]
@@ -902,10 +909,8 @@ def validate(
             if batch_idx >= max_batches:
                 break
 
-            # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
-            # Use async rollouts if vLLM async engine is enabled
             if _should_use_async_rollouts(master_config):
-                val_batch, gen_metrics = run_async_multi_turn_rollout(
+                val_batch, _ = run_async_multi_turn_rollout(
                     policy_generation,
                     val_batch,
                     tokenizer,
@@ -915,7 +920,7 @@ def validate(
                     greedy=False,
                 )
             else:
-                val_batch, gen_metrics = run_multi_turn_rollout(
+                val_batch, _ = run_multi_turn_rollout(
                     policy_generation,
                     val_batch,
                     tokenizer,
@@ -924,110 +929,83 @@ def validate(
                     max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
                     greedy=False,
                 )
-            rewards = val_batch["total_reward"]
-
-            total_rewards.extend(rewards.tolist())
-            total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
-
+            
+            # ADDED: Collect data from the processed batch
+            all_rewards.append(val_batch["total_reward"])
+            all_gen_lengths.append(val_batch["generation_lengths"])
+            all_prompt_lengths.append(val_batch["length"])
+            all_prompt_ids.extend(val_batch["idx"])
+            all_loss_multipliers.append(val_batch["loss_multiplier"])
+            if has_global_metrics:
+                all_extra_env_info.extend(val_batch["extra_env_info"])
+            
+            # This is used for printing samples, so we keep it inside the loop
             to_env = [
                 get_keys_from_message_log(
                     val_batch["message_log"][i], ["role", "content"]
                 )
                 for i in range(len(val_batch["message_log"]))
             ]
-            all_message_logs.extend(to_env)
 
-        # Calculate validation metrics
-        accuracy = sum(total_rewards) / len(total_rewards) if total_rewards else 0
-        if 'binarize_val_rewards' in master_config["grpo"] and master_config["grpo"]["binarize_val_rewards"]:
-            # If binary rewards are enabled, convert to accuracy
-            accuracy = sum(1 for r in total_rewards if r > 0) / len(total_rewards) if total_rewards else 0
+        if not all_rewards:
+            print("  ⚠️ No samples processed during validation, skipping metrics calculation.")
+            return {}, {}
 
-        avg_length = sum(total_lengths) / len(total_lengths) if total_lengths else 0
+        # MODIFIED: Calculate simple metrics from collected data
+        final_rewards = torch.cat(all_rewards)
+        accuracy = final_rewards.mean().item()
+        if master_config["grpo"].get("binarize_val_rewards", False):
+            accuracy = (final_rewards > 0).float().mean().item()
+        
+        avg_length = torch.cat(all_gen_lengths).float().mean().item()
 
         val_metrics = {
             "accuracy": accuracy,
             "avg_length": avg_length,
         }
+        
+        # MODIFIED: Call global_post_process_and_metrics with the full validation data
+        if has_global_metrics:
+            print("▶ Calculating detailed validation environment metrics...")
+            # Assemble the final batch for metrics calculation
+            final_val_batch = BatchedDataDict({
+                "total_reward": final_rewards,
+                "loss_multiplier": torch.cat(all_loss_multipliers),
+                "extra_env_info": all_extra_env_info,
+                "generation_lengths": torch.cat(all_gen_lengths),
+                "prompt_lengths": torch.cat(all_prompt_lengths),
+                "prompt_ids": all_prompt_ids,
+            })
+            
+            _, env_metrics = ray.get(main_env.global_post_process_and_metrics.remote(final_val_batch))
+            val_metrics.update(env_metrics)
 
-        # Print sample conversations
+        # Print sample conversations (using the last batch's `to_env`)
         try:
             print_message_log_samples(
-                all_message_logs,
-                total_rewards,
+                to_env, # Note: using last batch for sample printing
+                val_batch["total_reward"], # Note: using last batch for sample printing
                 num_samples=min(
                     master_config["logger"]["num_val_samples_to_print"],
-                    len(all_message_logs),
+                    len(to_env),
                 ),
                 step=step,
             )
         except Exception as e:
             print(f"\n  ⚠️ Error displaying message samples: {str(e)}")
-            print("  ⚠️ Continuing validation without displaying samples...")
-            
-        # Convenient Validation Logging
-        try:
-            convenient_val_inputs = []
-            convenient_val_outputs = []
-            
-            # Use the per-sample rewards collected during the loop
-            convenient_val_rewards = total_rewards
 
-            # Iterate over the collected message logs
-            for conversation_turns in all_message_logs:
-                user_prompt = "ERROR: User prompt not found."
-                assistant_response = "ERROR: Assistant response not found."
-                # Find the user and assistant content robustly
-                for turn in conversation_turns:
-                    if turn.get("role") == "user":
-                        user_prompt = turn.get("content", "")
-                    elif turn.get("role") == "assistant":
-                        assistant_response = turn.get("content", "")
-                
-                convenient_val_inputs.append(user_prompt)
-                convenient_val_outputs.append(assistant_response)
-
-            num_samples = len(convenient_val_inputs)
-            if num_samples > 0:
-                convenient_val_log_data = {
-                    "step": [step] * num_samples,
-                    "input": convenient_val_inputs,
-                    "output": convenient_val_outputs,
-                    "reward": convenient_val_rewards,
-                }
-                
-                logger.log_batched_dict_as_jsonl(
-                    convenient_val_log_data,
-                    f"val_data_convenient_{step}.jsonl"
-                )
-                
-                num_small_samples = 32
-                first_32_log_data = {
-                    key: value[:num_small_samples] for key, value in convenient_val_log_data.items()
-                }
-                logger.log_batched_dict_as_jsonl(
-                    first_32_log_data,
-                    f"val_data_convenient_{step}_first_32.jsonl"
-                )
-        except Exception as e:
-            print(f"⚠️ Error logging convenient validation data for step {step}: {str(e)}. Continuing without convenient logging.")
-
-    # Get timing metrics
     timing_metrics = timer.get_timing_metrics(reduction_op="sum")
-    validation_time = timing_metrics.get("total_validation_time", 0)
 
-    # Print summary of validation results
+    # Print summary
     print("\n📊 Validation Results:")
-    print(f"    • Accuracy: {accuracy:.4f}")
-    print(f"    • Average response length: {avg_length:.1f} tokens")
-    print(f"    • Samples processed: {len(total_rewards)}")
-
-    # Print timing information
+    print(f"    • Accuracy: {val_metrics['accuracy']:.4f}")
+    if "normalized_confidence_advantage" in val_metrics:
+        print(f"    • Normalized Confidence Advantage: {val_metrics['normalized_confidence_advantage']:.4f}")
+    print(f"    • Average response length: {val_metrics['avg_length']:.1f} tokens")
+    print(f"    • Samples processed: {len(final_rewards)}")
     print("\n  ⏱️  Validation Timing:")
-    validation_time = timing_metrics.get("total_validation_time", 0)
-    print(f"    • Total validation time: {validation_time:.2f}s")
-
-    # Make sure to reset the timer after validation
+    print(f"    • Total validation time: {timing_metrics.get('total_validation_time', 0):.2f}s")
+    
     timer.reset()
 
     return val_metrics, timing_metrics

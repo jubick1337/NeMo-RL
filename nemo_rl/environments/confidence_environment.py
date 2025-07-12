@@ -2,6 +2,7 @@ import logging
 from typing import Any, Optional, TypedDict
 import re
 import traceback
+import time # Added for timing
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 import ray
@@ -188,8 +189,6 @@ class ConfidenceEnvironment(BaseMathEnvironment):
         results_flat = [item for sublist in results_nested for item in sublist]
 
         rewards_list = []
-        # OPTIMIZED: Store the full verification results in the metadata during the initial step.
-        # This avoids re-calculating everything later in global_post_process_and_metrics.
         for i, res in enumerate(results_flat):
             rewards_list.append(res["reward"])
             metadata[i]["verification_result"] = res
@@ -210,14 +209,18 @@ class ConfidenceEnvironment(BaseMathEnvironment):
     def global_post_process_and_metrics(
         self, batch: BatchedDataDict[Any]
     ) -> tuple[BatchedDataDict[Any], dict[str, float | int]]:
+        
+        # ADDED: Start timer and logging
+        start_time = time.monotonic()
+        logging.info("DEVLOG: Starting global_post_process_and_metrics...")
 
         try:
-            # --- EFFICIENT DATA EXTRACTION ---
-            # The expensive verification is no longer run here. Instead, we directly
-            # extract the results that were pre-computed and stored in the `step` method.
             verify_results = [info["verification_result"] for info in batch["extra_env_info"]]
+            
+            # ADDED: Logging
+            after_extraction_time = time.monotonic()
+            logging.info(f"DEVLOG: ... data extraction took {after_extraction_time - start_time:.4f} seconds.")
 
-            # --- Convert Pre-computed Verification Results to Tensors ---
             device = batch["loss_multiplier"].device
             is_correct_float = torch.tensor([res["is_correct"] for res in verify_results], dtype=torch.float32, device=device)
             has_format_float = torch.tensor([res["has_format"] for res in verify_results], dtype=torch.float32, device=device)
@@ -228,7 +231,10 @@ class ConfidenceEnvironment(BaseMathEnvironment):
                 device=device
             )
 
-            # --- Start of Metric Calculations ---
+            # ADDED: Logging
+            after_tensor_conv_time = time.monotonic()
+            logging.info(f"DEVLOG: ... tensor conversion took {after_tensor_conv_time - after_extraction_time:.4f} seconds.")
+
             valid_mask = batch["loss_multiplier"]
             is_high_conf = (confidence_level == 1.0)
             is_low_conf = (confidence_level == 0.0)
@@ -261,7 +267,6 @@ class ConfidenceEnvironment(BaseMathEnvironment):
                 accuracy_on_completed = 0.0
 
             if "idx" in batch:
-                # Convert the list to a tensor
                 idx_tensor = torch.tensor(batch["idx"], dtype=torch.long, device=device)
                 pass_rate = calculate_pass_rate_by_idx(idx_tensor, is_correct_float)
             else:
@@ -271,9 +276,7 @@ class ConfidenceEnvironment(BaseMathEnvironment):
             num_samples = is_correct_float.shape[0]
             num_correct = is_correct_float.sum()
             num_incorrect = num_samples - num_correct
-
             num_confidence_inadequate = (is_correct_float * is_low_conf).sum() + ((1 - is_correct_float) * is_high_conf).sum()
-
             norm_coefficient = torch.min(num_correct, num_incorrect)
 
             if norm_coefficient > 0:
@@ -303,6 +306,11 @@ class ConfidenceEnvironment(BaseMathEnvironment):
             if "generation_lengths" in batch and "length" in batch:
                 metrics["generation_lengths"] = batch["generation_lengths"].float().mean().item()
                 metrics["prompt_lengths"] = batch["length"].float().mean().item()
+                
+            # ADDED: Logging
+            after_metrics_calc_time = time.monotonic()
+            logging.info(f"DEVLOG: ... metrics calculation took {after_metrics_calc_time - after_tensor_conv_time:.4f} seconds.")
+            logging.info(f"DEVLOG: Finished global_post_process_and_metrics. Total time: {after_metrics_calc_time - start_time:.4f} seconds.")
 
             return batch, metrics
 

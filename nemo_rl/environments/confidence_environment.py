@@ -186,9 +186,13 @@ class ConfidenceEnvironment(BaseMathEnvironment):
 
         results_nested = ray.get(futures)
         results_flat = [item for sublist in results_nested for item in sublist]
-        
-        # The step method ONLY returns rewards. The detailed metrics are calculated later.
-        rewards_list = [res["reward"] for res in results_flat]
+
+        rewards_list = []
+        # Attach the full verification results to the metadata.
+        # The modified grpo.py will now correctly propagate this back.
+        for i, res in enumerate(results_flat):
+            rewards_list.append(res["reward"])
+            metadata[i]["verification_result"] = res
 
         rewards = torch.tensor(rewards_list, dtype=torch.float32).cpu()
         terminateds = torch.ones_like(rewards, dtype=torch.bool).cpu()
@@ -197,7 +201,7 @@ class ConfidenceEnvironment(BaseMathEnvironment):
 
         return EnvironmentReturn(
             observations=observations,
-            metadata=metadata, # Pass the original, unmodified metadata back
+            metadata=metadata,
             next_stop_strings=[None] * len(message_log_batch),
             rewards=rewards,
             terminateds=terminateds,
@@ -208,27 +212,12 @@ class ConfidenceEnvironment(BaseMathEnvironment):
     ) -> tuple[BatchedDataDict[Any], dict[str, float | int]]:
 
         try:
-            # --- Robust Data Extraction and Re-verification ---
-            # This is the original, robust implementation that fixes the KeyError.
-            # It re-runs verification on the final batch data.
-            assistant_responses = [
-                "".join([msg["content"] for msg in convo if msg["role"] == "assistant"])
-                for convo in batch["message_log"]
-            ]
-            ground_truths = [g["ground_truth"] for g in batch["extra_env_info"]]
+            # --- EFFICIENT DATA EXTRACTION ---
+            # This now reads the pre-computed results that were propagated back
+            # by the modified grpo.py, avoiding the need to re-verify.
+            verify_results = [info["verification_result"] for info in batch["extra_env_info"]]
 
-            chunked_responses = chunk_list_to_workers(assistant_responses, self.num_workers)
-            chunked_gt = chunk_list_to_workers(ground_truths, self.num_workers)
-
-            futures = [
-                self.workers[i].verify.remote(res_chunk, gt_chunk)
-                for i, (res_chunk, gt_chunk) in enumerate(zip(chunked_responses, chunked_gt))
-            ]
-
-            results_nested = ray.get(futures)
-            verify_results = [item for sublist in results_nested for item in sublist]
-
-            # --- Convert Fresh Verification Results to Tensors ---
+            # --- Convert Pre-computed Verification Results to Tensors ---
             device = batch["loss_multiplier"].device
             is_correct_float = torch.tensor([res["is_correct"] for res in verify_results], dtype=torch.float32, device=device)
             has_format_float = torch.tensor([res["has_format"] for res in verify_results], dtype=torch.float32, device=device)
@@ -259,6 +248,7 @@ class ConfidenceEnvironment(BaseMathEnvironment):
 
             num_high_confidence = is_high_conf.float().sum()
             precision_of_high_confidence = (is_correct_float * is_high_conf).sum() / num_high_confidence if num_high_confidence > 0 else torch.tensor(0.0)
+            
             accuracy = (is_correct_float * valid_mask).mean().item()
 
             completed_samples_mask = valid_mask.bool()

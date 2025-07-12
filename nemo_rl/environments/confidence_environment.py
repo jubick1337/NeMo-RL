@@ -189,6 +189,8 @@ class ConfidenceEnvironment(BaseMathEnvironment):
         results_flat = [item for sublist in results_nested for item in sublist]
 
         rewards_list = []
+        # OPTIMIZED: Store the full verification results in the metadata during the initial step.
+        # This avoids re-calculating everything later in global_post_process_and_metrics.
         for i, res in enumerate(results_flat):
             rewards_list.append(res["reward"])
             metadata[i]["verification_result"] = res

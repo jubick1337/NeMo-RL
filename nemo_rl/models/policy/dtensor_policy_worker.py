@@ -557,12 +557,14 @@ class DTensorPolicyWorker:
                         else:
                             logits = outputs.logits
 
-                        # Divide logits by temperature
-                        if (
-                            "generation" in self.cfg
-                            and self.cfg["generation"] is not None
-                        ):
-                            logits.div_(self.cfg["generation"]["temperature"])
+                        # Conditionally divide logits by temperature based on VLLM engine version
+                        if "generation" in self.cfg and self.cfg["generation"] is not None:
+                            # The V1 engine returns raw logits before temperature scaling.
+                            # The V0 engine (when VLLM_USE_V1 is not '1') returns scaled logits.
+                            # Therefore, we only divide if we are NOT using the V1 engine.
+                            use_v1_engine = os.environ.get('VLLM_USE_V1') == '1'
+                            if not use_v1_engine:
+                                logits.div_(self.cfg["generation"]["temperature"])
 
                         if self.cp_size > 1:
                             seq_index_dtensor = (

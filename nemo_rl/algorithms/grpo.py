@@ -632,13 +632,12 @@ def grpo_train(
                         advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
                     )
 
-            # convenient logging block moved here
+
             try:
-                # Use the final `repeated_batch` which contains the complete conversations
-                # This is simpler and more robust, just like the validation logger.
-                complete_message_logs = get_keys_from_message_log(
-                    repeated_batch["message_log"], ["role", "content"]
-                )
+                complete_message_logs = [
+                    get_keys_from_message_log(log, ["role", "content"])
+                    for log in repeated_batch["message_log"]
+                ]
 
                 convenient_train_inputs = []
                 convenient_train_outputs = []

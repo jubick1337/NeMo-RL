@@ -893,14 +893,15 @@ def validate(
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...")
 
-        # ADDED: Initialize lists to collect data across all validation batches
         all_rewards = []
         all_gen_lengths = []
         all_prompt_lengths = []
         all_prompt_ids = []
         all_extra_env_info = []
         all_loss_multipliers = []
-        
+        # ADDED: Collect all message logs to print better samples
+        all_message_logs = []
+
         max_batches = (
             master_config["grpo"]["max_val_samples"]
             // master_config["grpo"]["val_batch_size"]
@@ -929,8 +930,7 @@ def validate(
                     max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
                     greedy=False,
                 )
-            
-            # ADDED: Collect data from the processed batch
+
             all_rewards.append(val_batch["total_reward"])
             all_gen_lengths.append(val_batch["generation_lengths"])
             all_prompt_lengths.append(val_batch["length"])
@@ -939,35 +939,31 @@ def validate(
             if has_global_metrics:
                 all_extra_env_info.extend(val_batch["extra_env_info"])
             
-            # This is used for printing samples, so we keep it inside the loop
+            # ADDED: Collect message logs from all batches
             to_env = [
-                get_keys_from_message_log(
-                    val_batch["message_log"][i], ["role", "content"]
-                )
+                get_keys_from_message_log(val_batch["message_log"][i], ["role", "content"])
                 for i in range(len(val_batch["message_log"]))
             ]
+            all_message_logs.extend(to_env)
 
         if not all_rewards:
             print("  ⚠️ No samples processed during validation, skipping metrics calculation.")
             return {}, {}
 
-        # MODIFIED: Calculate simple metrics from collected data
         final_rewards = torch.cat(all_rewards)
         accuracy = final_rewards.mean().item()
         if master_config["grpo"].get("binarize_val_rewards", False):
             accuracy = (final_rewards > 0).float().mean().item()
-        
+
         avg_length = torch.cat(all_gen_lengths).float().mean().item()
 
         val_metrics = {
             "accuracy": accuracy,
             "avg_length": avg_length,
         }
-        
-        # MODIFIED: Call global_post_process_and_metrics with the full validation data
+
         if has_global_metrics:
             print("▶ Calculating detailed validation environment metrics...")
-            # Assemble the final batch for metrics calculation
             final_val_batch = BatchedDataDict({
                 "total_reward": final_rewards,
                 "loss_multiplier": torch.cat(all_loss_multipliers),
@@ -976,19 +972,18 @@ def validate(
                 "prompt_lengths": torch.cat(all_prompt_lengths),
                 "prompt_ids": all_prompt_ids,
             })
-            
             _, env_metrics = ray.get(main_env.global_post_process_and_metrics.remote(final_val_batch))
             val_metrics.update(env_metrics)
 
-        # Print sample conversations (using the last batch's `to_env`)
+        # MODIFIED: Print samples using the collected logs and converting rewards to a list
         try:
+            num_to_print = min(
+                master_config["logger"]["num_val_samples_to_print"], len(all_message_logs)
+            )
             print_message_log_samples(
-                to_env, # Note: using last batch for sample printing
-                val_batch["total_reward"], # Note: using last batch for sample printing
-                num_samples=min(
-                    master_config["logger"]["num_val_samples_to_print"],
-                    len(to_env),
-                ),
+                all_message_logs[:num_to_print],
+                final_rewards[:num_to_print].tolist(),  # Convert tensor to list
+                num_samples=num_to_print,
                 step=step,
             )
         except Exception as e:
@@ -996,12 +991,11 @@ def validate(
 
     timing_metrics = timer.get_timing_metrics(reduction_op="sum")
 
-    # Print summary
     print("\n📊 Validation Results:")
     print(f"    • Accuracy: {val_metrics['accuracy']:.4f}")
     if "normalized_confidence_advantage" in val_metrics:
         print(f"    • Normalized Confidence Advantage: {val_metrics['normalized_confidence_advantage']:.4f}")
-    print(f"    • Average response length: {val_metrics['avg_length']:.1f} tokens")
+    print(f"    • Average response length: {val_metrics.get('avg_length', 0):.1f} tokens")
     print(f"    • Samples processed: {len(final_rewards)}")
     print("\n  ⏱️  Validation Timing:")
     print(f"    • Total validation time: {timing_metrics.get('total_validation_time', 0):.2f}s")

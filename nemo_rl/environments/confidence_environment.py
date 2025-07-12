@@ -262,7 +262,6 @@ class ConfidenceEnvironment(BaseMathEnvironment):
     ) -> tuple[BatchedDataDict[Any], dict[str, float | int]]:
         try:
             # --- EFFICIENT DATA EXTRACTION ---
-            # This now reads the pre-computed results that were propagated from the `step` method.
             verify_results = [info["verification_result"] for info in batch["extra_env_info"]]
 
             # --- Convert Pre-computed Verification Results to Tensors ---
@@ -324,7 +323,9 @@ class ConfidenceEnvironment(BaseMathEnvironment):
             )
 
             if "prompt_ids" in batch:
-                pass_rate = calculate_pass_rate_by_idx(batch["prompt_ids"], is_correct_float)
+                # MODIFIED: Convert the list of prompt IDs to a tensor before using it.
+                idx_tensor = torch.tensor(batch["prompt_ids"], dtype=torch.long, device=device)
+                pass_rate = calculate_pass_rate_by_idx(idx_tensor, is_correct_float)
             else:
                 logging.warning(
                     "Key 'prompt_ids' not found in batch for pass_rate calculation. Defaulting to 0.0."

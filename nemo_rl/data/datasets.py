@@ -142,6 +142,7 @@ def rl_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
         idx=idx,
         batch_max_length=batch_max_length,
         stop_strings=stop_strings,
+        truncated=torch.zeros(len(data_batch), dtype=torch.bool),  # Initialize as not truncated
     )
     return output
 

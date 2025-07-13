@@ -671,8 +671,21 @@ def grpo_train(
 
             with timer.time("data_processing"):
                 use_overlong_filtering = master_config["grpo"].get("overlong_filtering", False)
+                
+                # Update loss_multiplier for truncated samples when overlong_filtering is enabled
+                if use_overlong_filtering and "truncated" in repeated_batch:
+                    # Create a copy to avoid modifying the original batch
+                    loss_multiplier = repeated_batch["loss_multiplier"].clone()
+                    truncated = repeated_batch["truncated"]
+                    # Convert to tensor if it's a list
+                    if isinstance(truncated, list):
+                        truncated = torch.tensor(truncated, dtype=torch.bool)
+                    # Set loss_multiplier to 0 for truncated samples
+                    loss_multiplier[truncated] = 0.0
+                    repeated_batch["loss_multiplier"] = loss_multiplier
+                
                 for i, message_log in enumerate(repeated_batch["message_log"]):
-                    is_filtered = use_overlong_filtering and repeated_batch.get("truncated", [False] * repeated_batch.size)[i]
+                    is_filtered = use_overlong_filtering and repeated_batch["truncated"][i]
                     for j, message in enumerate(message_log):
                         if message["role"] == "assistant":
                             if is_filtered:

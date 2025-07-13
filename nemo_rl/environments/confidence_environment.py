@@ -316,8 +316,15 @@ class ConfidenceEnvironment(BaseMathEnvironment):
             # Accuracy on ALL samples (including truncated/invalid ones)
             accuracy = is_correct_float.mean().item()
 
-            # Accuracy only on valid samples (non-truncated)
+            # Accuracy only on completed samples
+            # Completed means: valid (loss_multiplier > 0) AND not truncated
+            # When overlong_filtering=True, loss_multiplier=0 for truncated samples
             completed_samples_mask = valid_mask.bool()
+            if "truncated" in batch:
+                # For validation or when overlong_filtering=False, 
+                # we need to exclude truncated samples explicitly
+                completed_samples_mask = completed_samples_mask & ~batch["truncated"].bool()
+            
             accuracy_on_completed = (
                 is_correct_float[completed_samples_mask].mean().item()
                 if completed_samples_mask.sum() > 0

@@ -313,8 +313,10 @@ class ConfidenceEnvironment(BaseMathEnvironment):
                 else torch.tensor(0.0)
             )
 
-            accuracy = (is_correct_float * valid_mask).mean().item()
+            # Accuracy on ALL samples (including truncated/invalid ones)
+            accuracy = is_correct_float.mean().item()
 
+            # Accuracy only on valid samples (non-truncated)
             completed_samples_mask = valid_mask.bool()
             accuracy_on_completed = (
                 is_correct_float[completed_samples_mask].mean().item()
@@ -332,12 +334,23 @@ class ConfidenceEnvironment(BaseMathEnvironment):
                 )
                 pass_rate = 0.0
 
+            # Calculate NCA across ALL samples (including those with loss_multiplier=0)
+            # loss_multiplier is for training, not for metrics evaluation
             num_samples = is_correct_float.shape[0]
             num_correct = is_correct_float.sum()
             num_incorrect = num_samples - num_correct
-            num_confidence_inadequate = (is_correct_float * is_low_conf).sum() + (
-                (1 - is_correct_float) * is_high_conf
-            ).sum()
+            
+            # Identify samples with unparseable confidence
+            no_conf_mask = confidence_level == -1.0
+            
+            # Calculate inadequate confidence: correct with low conf + incorrect with high conf
+            # IMPORTANT: Also count unparseable confidence as inadequate (conservative approach)
+            num_confidence_inadequate = (
+                (is_correct_float * is_low_conf).sum() + 
+                ((1 - is_correct_float) * is_high_conf).sum() +
+                no_conf_mask.sum()  # Treat unparseable as inadequate
+            )
+            
             norm_coefficient = torch.min(num_correct, num_incorrect)
 
             if norm_coefficient > 0:
@@ -348,8 +361,8 @@ class ConfidenceEnvironment(BaseMathEnvironment):
 
             metrics = {
                 "mean_reward": (batch["total_reward"] * valid_mask).mean().item(),
-                "accuracy": accuracy,
-                "accuracy_on_completed": accuracy_on_completed,
+                "accuracy": accuracy,  # All samples including truncated
+                "accuracy_on_completed": accuracy_on_completed,  # Only non-truncated samples
                 "normalized_confidence_advantage": normalized_confidence_advantage,
                 "pass@samples_per_prompt": pass_rate,
                 "precision_of_high_confidence": precision_of_high_confidence.item(),

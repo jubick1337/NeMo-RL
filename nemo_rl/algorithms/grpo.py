@@ -516,7 +516,7 @@ def grpo_train(
             val_task_to_env,
             step=0,
             master_config=master_config,
-            logger=logger,  # Pass the logger object
+            logger=logger,
         )
         policy_generation.finish_generation()
         logger.log_metrics(val_metrics, step, prefix="validation")
@@ -546,7 +546,7 @@ def grpo_train(
                     repeated_batch["message_log"],
                     pad_value_dict={"token_ids": tokenizer.pad_token_id},
                 )
-
+                
                 repeated_batch["generation_lengths"] = input_lengths
                 input_ids = batched_flat["token_ids"]
 
@@ -591,15 +591,13 @@ def grpo_train(
                         greedy=False,
                     )
                 policy_generation.finish_generation()
-
-            # Calculate environment metrics
+            
             print("▶ Calculating environment metrics...")
             env_metrics = {}
             with timer.time("env_metrics_calculation"):
                 if task_to_env:
                     main_env = next(iter(task_to_env.values()))
                     if hasattr(main_env, "global_post_process_and_metrics"):
-                        # Create a lightweight batch with only the necessary data for metrics
                         metrics_batch = BatchedDataDict({
                             "total_reward": repeated_batch["total_reward"],
                             "loss_multiplier": repeated_batch["loss_multiplier"],
@@ -608,18 +606,13 @@ def grpo_train(
                             "prompt_lengths": repeated_batch["length"],
                             "prompt_ids": repeated_batch["idx"],
                         })
-                        # Send only the small, relevant batch, not the whole repeated_batch
                         _, env_metrics = ray.get(main_env.global_post_process_and_metrics.remote(metrics_batch))
                     else:
                         print("⚠️  Environment does not have global_post_process_and_metrics method.")
 
-
-            # Calculate rewards & advantages
             print("▶ Processing rewards...")
             with timer.time("reward_calculation"):
-                # Extract rewards from final_batch
                 rewards = repeated_batch["total_reward"]
-
                 print("▶ Computing advantages...")
                 baseline, std = calculate_baseline_and_std_per_prompt(
                     input_ids,
@@ -630,37 +623,29 @@ def grpo_train(
                     ],
                 )
                 advantages = (rewards - baseline).unsqueeze(-1)
-
                 if master_config["grpo"]["normalize_rewards"]:
-                    # don't sharpen the ones with no variation
                     zero_std_mask = std > 0
                     advantages[zero_std_mask] = (
                         advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
                     )
 
-            # Convenient Logging
             try:
                 complete_message_logs = [
                     get_keys_from_message_log(log, ["role", "content"])
                     for log in repeated_batch["message_log"]
                 ]
-
                 convenient_train_inputs = []
                 convenient_train_outputs = []
-
                 for conversation_turns in complete_message_logs:
                     user_prompt = "ERROR: User prompt not found."
                     assistant_response = "ERROR: Assistant response not found."
-                    # Find the user and assistant content in each completed conversation
                     for turn in conversation_turns:
                         if turn.get("role") == "user":
                             user_prompt = turn.get("content", "")
                         elif turn.get("role") == "assistant":
                             assistant_response = turn.get("content", "")
-
                     convenient_train_inputs.append(user_prompt)
                     convenient_train_outputs.append(assistant_response)
-
                 num_samples = len(convenient_train_inputs)
                 if num_samples > 0:
                     convenient_train_log_data = {
@@ -669,12 +654,10 @@ def grpo_train(
                         "output": convenient_train_outputs,
                         "reward": rewards.tolist(),
                     }
-
                     logger.log_batched_dict_as_jsonl(
                         convenient_train_log_data,
                         f"train_data_convenient_{step + 1}.jsonl"
                     )
-
                     num_small_samples = 32
                     first_32_log_data = {
                         key: value[:num_small_samples] for key, value in convenient_train_log_data.items()
@@ -688,10 +671,8 @@ def grpo_train(
 
             with timer.time("data_processing"):
                 use_overlong_filtering = master_config["grpo"].get("overlong_filtering", False)
-
                 for i, message_log in enumerate(repeated_batch["message_log"]):
                     is_filtered = use_overlong_filtering and repeated_batch.get("truncated", [False] * repeated_batch.size)[i]
-
                     for j, message in enumerate(message_log):
                         if message["role"] == "assistant":
                             if is_filtered:
@@ -700,7 +681,6 @@ def grpo_train(
                                 message["token_loss_mask"] = torch.ones_like(message["token_ids"])
                         else:
                             message["token_loss_mask"] = torch.zeros_like(message["token_ids"])
-
                         if "generation_logprobs" not in message:
                             message["generation_logprobs"] = torch.zeros_like(
                                 message["token_ids"], dtype=torch.float32
@@ -708,19 +688,17 @@ def grpo_train(
                         message["advantages"] = advantages[i].expand(
                             message["token_ids"].shape
                         )
-
-                flat_messages, input_lengths = batched_message_log_to_flat_message(
+                flat_messages, final_input_lengths = batched_message_log_to_flat_message(
                     repeated_batch["message_log"],
                     pad_value_dict={"token_ids": tokenizer.pad_token_id},
                     make_sequence_length_divisible_by=master_config["policy"][
                         "make_sequence_length_divisible_by"
                     ],
                 )
-
                 train_data = BatchedDataDict[ClippedPGLossDataDict](
                     {
                         "input_ids": flat_messages["token_ids"],
-                        "input_lengths": input_lengths,
+                        "input_lengths": final_input_lengths,
                         "advantages": flat_messages["advantages"],
                         "generation_logprobs": flat_messages["generation_logprobs"],
                         "token_mask": flat_messages["token_loss_mask"],
@@ -777,6 +755,7 @@ def grpo_train(
                 )
                 logger.log_metrics(val_metrics, step + 1, prefix="validation")
 
+            ## Checkpointing
             consumed_samples += master_config["grpo"]["num_prompts_per_step"]
             if master_config["checkpointing"]["enabled"] and (
                 is_last_step
@@ -784,10 +763,45 @@ def grpo_train(
             ):
                 policy.prepare_for_training()
 
-                val_reward_for_ckpt = val_metrics["accuracy"] if val_metrics else grpo_save_state["val_reward"]
+                # --- START OF ROBUST CHECKPOINTING LOGIC ---
+                
+                # First, update the save state with all available validation metrics.
+                # The checkpointer can then look up any metric by its key.
+                if val_metrics:
+                    # The logger prefixes metrics with "validation/", but the checkpointer
+                    # expects the raw key (e.g. "accuracy").
+                    grpo_save_state.update(val_metrics)
+
+                try:
+                    # TRY THE NEW FLEXIBLE LOGIC
+                    metric_key_from_config = master_config["checkpointing"]["metric_name"]
+                    
+                    # Handle if the user provides the prefixed name (e.g., "validation/accuracy")
+                    # by checking for both prefixed and non-prefixed versions.
+                    metric_key_no_prefix = metric_key_from_config.replace("validation/", "")
+                    
+                    # Default to the old "val_reward" if the key from config isn't in the metrics.
+                    # This check makes the logic robust.
+                    if val_metrics and metric_key_no_prefix not in val_metrics:
+                        raise KeyError(f"Metric '{metric_key_from_config}' not found in val_metrics.")
+                    
+                    # If we are here, the specified metric exists. The checkpointer will use it.
+                    # For backward compatibility with old checkpoints, we also set "val_reward"
+                    if val_metrics and "accuracy" in val_metrics:
+                         grpo_save_state["val_reward"] = val_metrics["accuracy"]
+
+                except (KeyError, TypeError):
+                    # CATCH ERRORS AND FALLBACK TO DEFAULT BEHAVIOR
+                    print(f"⚠️  Warning: Could not use metric '{master_config['checkpointing']['metric_name']}' for checkpointing.")
+                    print("     Falling back to default behavior (using 'accuracy' as 'val_reward').")
+                    if val_metrics and "accuracy" in val_metrics:
+                        grpo_save_state["val_reward"] = val_metrics["accuracy"]
+                
+                # --- END OF ROBUST CHECKPOINTING LOGIC ---
+
                 grpo_save_state["step"] = step + 1
-                grpo_save_state["val_reward"] = val_reward_for_ckpt
                 grpo_save_state["consumed_samples"] = consumed_samples
+                
                 with timer.time("checkpointing"):
                     print(f"Saving checkpoint for step {step + 1}...")
                     checkpoint_path = checkpointer.init_tmp_checkpoint(
@@ -808,13 +822,14 @@ def grpo_train(
                     )
                     checkpointer.finalize_checkpoint(checkpoint_path)
                 policy.offload_after_refit()
-
+        
         # Logging
+        # Note: final_input_lengths from the second batched_message_log_to_flat_message call
         log_data = {"content": flat_messages["content"]}
         log_data["rewards"] = rewards.tolist()
         log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
         log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
-        log_data["input_lengths"] = input_lengths.tolist()
+        log_data["input_lengths"] = final_input_lengths.tolist()
         logger.log_batched_dict_as_jsonl(log_data, f"train_data_step{step}.jsonl")
 
         print("\n📊 Training Results:")
@@ -837,7 +852,7 @@ def grpo_train(
             logger.log_plot_token_mult_prob_error(
                 {
                     "prompt_lengths": repeated_batch["length"],
-                    "full_lengths": input_lengths,
+                    "full_lengths": final_input_lengths,
                     "generation_logprobs": train_data["generation_logprobs"],
                     "prev_logprobs": train_data["prev_logprobs"],
                     "token_mask": train_data["token_mask"],

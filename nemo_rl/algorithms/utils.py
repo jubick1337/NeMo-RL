@@ -66,7 +66,7 @@ def calculate_baseline_and_std_per_prompt(
     if device_ordinal == -1:
         reward_device = torch.device("cpu")
     else:
-        reward_device = torch.device(reward_device)
+        reward_device = torch.device(f"cuda:{device_ordinal}")
 
     for i in range(len(unique_prompts)):
         is_matching_prompt = (prompts == unique_prompts[i]).all(1)
@@ -74,37 +74,58 @@ def calculate_baseline_and_std_per_prompt(
             is_matching_prompt
         ]
 
-        if leave_one_out_baseline:
-            baseline_mask_matrix = (1 - torch.eye(len(prompt_idx))).to(reward_device)
-        else:
-            baseline_mask_matrix = torch.ones((len(prompt_idx), len(prompt_idx))).to(
-                reward_device
-            )
-
         if valid_mask[prompt_idx].sum() <= 1:
             # Ignore sample: there are no valid responses, so set baseline equal to reward
             # to ignore it in the loss computation
             baseline[prompt_idx] = rewards[prompt_idx]
+            # Set std to 0 for single samples
+            sq_baseline[prompt_idx] = rewards[prompt_idx] ** 2
         else:
-            num_valid = valid_mask[prompt_idx].float().sum() - int(
-                leave_one_out_baseline
-            )
-            prompt_baseline = (
-                torch.matmul(
-                    baseline_mask_matrix, rewards[prompt_idx] * valid_mask[prompt_idx]
+            if leave_one_out_baseline:
+                # For leave-one-out, we need to compute the standard deviation properly
+                # Each sample gets its own baseline (mean of others) but we need a 
+                # consistent std for the whole group
+                baseline_mask_matrix = (1 - torch.eye(len(prompt_idx))).to(reward_device)
+                num_valid = valid_mask[prompt_idx].float().sum() - 1
+                
+                prompt_baseline = (
+                    torch.matmul(
+                        baseline_mask_matrix, rewards[prompt_idx] * valid_mask[prompt_idx]
+                    )
+                    / num_valid
                 )
-                / num_valid
-            )
-            prompt_baseline_square = (
-                torch.matmul(
-                    baseline_mask_matrix,
-                    (rewards[prompt_idx] ** 2) * valid_mask[prompt_idx],
+                baseline[prompt_idx] = prompt_baseline
+                
+                # For std, use the population std of all samples in the group
+                # This ensures mathematical consistency
+                group_mean = (rewards[prompt_idx] * valid_mask[prompt_idx]).sum() / valid_mask[prompt_idx].sum()
+                group_var = ((rewards[prompt_idx] - group_mean) ** 2 * valid_mask[prompt_idx]).sum() / valid_mask[prompt_idx].sum()
+                group_std = group_var.sqrt()
+                
+                # All samples in the group get the same std
+                sq_baseline[prompt_idx] = baseline[prompt_idx] ** 2 + group_std ** 2
+            else:
+                baseline_mask_matrix = torch.ones((len(prompt_idx), len(prompt_idx))).to(
+                    reward_device
                 )
-                / num_valid
-            )
+                num_valid = valid_mask[prompt_idx].float().sum()
+                
+                prompt_baseline = (
+                    torch.matmul(
+                        baseline_mask_matrix, rewards[prompt_idx] * valid_mask[prompt_idx]
+                    )
+                    / num_valid
+                )
+                prompt_baseline_square = (
+                    torch.matmul(
+                        baseline_mask_matrix,
+                        (rewards[prompt_idx] ** 2) * valid_mask[prompt_idx],
+                    )
+                    / num_valid
+                )
 
-            baseline[prompt_idx] = prompt_baseline
-            sq_baseline[prompt_idx] = prompt_baseline_square
+                baseline[prompt_idx] = prompt_baseline
+                sq_baseline[prompt_idx] = prompt_baseline_square
 
     std = (sq_baseline - baseline.square()).sqrt().nan_to_num(0)
     return baseline, std

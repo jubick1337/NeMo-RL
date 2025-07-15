@@ -614,8 +614,22 @@ def grpo_train(
             with timer.time("reward_calculation"):
                 rewards = repeated_batch["total_reward"]
                 print("▶ Computing advantages...")
+                
+                # Extract only the prompt tokens for baseline calculation
+                prompt_lengths = repeated_batch["length"]
+                prompt_tokens = []
+                for i in range(input_ids.shape[0]):
+                    prompt_tokens.append(input_ids[i, :prompt_lengths[i]])
+                
+                # Pad prompt tokens to have consistent shape
+                max_prompt_length = prompt_lengths.max().item()
+                prompt_ids = torch.zeros((input_ids.shape[0], max_prompt_length), 
+                                        dtype=input_ids.dtype, device=input_ids.device)
+                for i in range(input_ids.shape[0]):
+                    prompt_ids[i, :prompt_lengths[i]] = prompt_tokens[i]
+                
                 baseline, std = calculate_baseline_and_std_per_prompt(
-                    input_ids,
+                    prompt_ids,  # Now using only prompt tokens
                     rewards,
                     torch.ones_like(rewards),
                     leave_one_out_baseline=master_config["grpo"][

@@ -887,7 +887,6 @@ def grpo_train(
         # Logging
         # Only convenient logging is kept - detailed token-level logging was removed
 
-        print("\n📊 Training Results:")
         metrics = {
             "loss": train_results["loss"].numpy(),
             "reward": rewards.numpy(),

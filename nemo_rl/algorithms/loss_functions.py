@@ -214,6 +214,27 @@ class ClippedPGLossFn(LossFunction):
 
         # Determine which value to use for clipping (max for pessimistic estimate)
         clip_loss = torch.max(loss1, loss2)
+        
+        # Calculate PPO clipping metrics
+        with torch.no_grad():
+            if not self.disable_ppo_ratio:
+                # Mean PPO ratio
+                ppo_ratio_mean = masked_mean(
+                    ratios.detach(),
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                ).item()
+                
+                # Fraction of clipped samples
+                clipped = (ratios != ratios_clamped).float()
+                ppo_fraction_clipped = masked_mean(
+                    clipped,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                ).item()
+            else:
+                ppo_ratio_mean = 1.0  # Default for REINFORCE
+                ppo_fraction_clipped = 0.0
 
         # Dual-clipping see https://arxiv.org/pdf/1912.09729
         if self.ratio_clip_c is not None:
@@ -295,6 +316,8 @@ class ClippedPGLossFn(LossFunction):
                 "sampling_importance_ratio": sample_importance_ratio.item(),
                 "num_valid_samples": sample_mask.sum().item(),
                 "approx_entropy": seq_entropy_approx.item(),
+                "ppo_ratio_mean": ppo_ratio_mean,
+                "ppo_fraction_clipped": ppo_fraction_clipped,
             },
         )
 

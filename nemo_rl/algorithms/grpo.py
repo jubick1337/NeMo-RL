@@ -640,6 +640,42 @@ def grpo_train(
                     advantages[zero_std_mask] = (
                         advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
                     )
+                
+                # Calculate debugging metrics for rewards and advantages
+                valid_mask = repeated_batch["loss_multiplier"] > 0
+                if valid_mask.any():
+                    valid_rewards = rewards[valid_mask]
+                    valid_advantages = advantages[valid_mask].squeeze(-1)
+                    
+                    # Reward distribution metrics
+                    reward_metrics = {
+                        "reward_mean": valid_rewards.mean().item(),
+                        "reward_std": valid_rewards.std().item() if len(valid_rewards) > 1 else 0.0,
+                        "reward_max": valid_rewards.max().item(),
+                        "reward_min": valid_rewards.min().item(),
+                    }
+                    
+                    # Advantage distribution metrics (Most Critical)
+                    advantage_metrics = {
+                        "advantage_mean": valid_advantages.mean().item(),
+                        "advantage_std": valid_advantages.std().item() if len(valid_advantages) > 1 else 0.0,
+                        "advantage_max": valid_advantages.max().item(),
+                        "advantage_min": valid_advantages.min().item(),
+                    }
+                else:
+                    # Default values if all samples are filtered
+                    reward_metrics = {
+                        "reward_mean": 0.0,
+                        "reward_std": 0.0,
+                        "reward_max": 0.0,
+                        "reward_min": 0.0,
+                    }
+                    advantage_metrics = {
+                        "advantage_mean": 0.0,
+                        "advantage_std": 0.0,
+                        "advantage_max": 0.0,
+                        "advantage_min": 0.0,
+                    }
 
             try:
                 complete_message_logs = [
@@ -871,6 +907,8 @@ def grpo_train(
                 metrics[k] = np.sum(v).item()
         metrics.update(rollout_metrics)
         metrics.update(env_metrics)
+        metrics.update(reward_metrics)
+        metrics.update(advantage_metrics)
 
         timing_metrics: dict[str, float] = timer.get_timing_metrics(reduction_op="sum")
         if metrics.get("token_mult_prob_error", 0) > 1.05:

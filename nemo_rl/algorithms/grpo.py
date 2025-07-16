@@ -359,6 +359,8 @@ def setup(
         # wait for all futures to complete
         ray.get(futures_train + futures_inference)
 
+    # Add generation temperature to loss config
+    loss_config["generation_temperature"] = generation_config["temperature"]
     loss_fn = ClippedPGLossFn(loss_config)
 
     print("\n" + "=" * 60)

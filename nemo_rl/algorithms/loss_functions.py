@@ -37,6 +37,7 @@ class ClippedPGLossConfig(TypedDict):
     use_on_policy_kl_approximation: bool
     use_importance_sampling_correction: bool
     token_level_loss: bool
+    generation_temperature: float
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -101,6 +102,7 @@ class ClippedPGLossFn(LossFunction):
         self.use_importance_sampling_correction = cfg[
             "use_importance_sampling_correction"
         ]
+        self.generation_temperature = cfg["generation_temperature"]
 
         self.loss_type = (
             LossType.TOKEN_LEVEL if cfg["token_level_loss"] else LossType.SEQUENCE_LEVEL
@@ -288,6 +290,30 @@ class ClippedPGLossFn(LossFunction):
                 mask,
                 global_normalization_factor=global_valid_toks,
             )
+            
+            # Calculate temperature-adjusted entropy
+            # H(P_T) = -sum(p_T(i) * log(p_T(i))) where p_T are temperature-scaled probabilities
+            # Remove last position's logits (same as done for curr_logprobs)
+            next_token_logits_wo_last = next_token_logits[:, :-1]
+            
+            # Apply temperature scaling
+            adjusted_logits = next_token_logits_wo_last / self.generation_temperature
+            
+            # Calculate temperature-scaled log probabilities
+            log_probs_T = torch.nn.functional.log_softmax(adjusted_logits, dim=-1)
+            
+            # Calculate temperature-scaled probabilities
+            probs_T = torch.exp(log_probs_T)
+            
+            # Calculate per-token entropy: -sum(p * log(p))
+            token_entropy = -torch.sum(probs_T * log_probs_T, dim=-1)
+            
+            # Average the per-token entropy across all valid tokens
+            temp_adj_entropy = masked_mean(
+                token_entropy,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            )
 
         loss = actor_loss + kl
         with torch.no_grad():
@@ -316,6 +342,7 @@ class ClippedPGLossFn(LossFunction):
                 "sampling_importance_ratio": sample_importance_ratio.item(),
                 "num_valid_samples": sample_mask.sum().item(),
                 "approx_entropy": seq_entropy_approx.item(),
+                "temperature_adjusted_entropy": temp_adj_entropy.item(),
                 "ppo_ratio_mean": ppo_ratio_mean,
                 "ppo_fraction_clipped": ppo_fraction_clipped,
             },

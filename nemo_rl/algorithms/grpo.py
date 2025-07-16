@@ -885,13 +885,7 @@ def grpo_train(
                 policy.offload_after_refit()
         
         # Logging
-        # Note: final_input_lengths from the second batched_message_log_to_flat_message call
-        log_data = {"content": flat_messages["content"]}
-        log_data["rewards"] = rewards.tolist()
-        log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
-        log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
-        log_data["input_lengths"] = final_input_lengths.tolist()
-        logger.log_batched_dict_as_jsonl(log_data, f"train_data_step{step}.jsonl")
+        # Only convenient logging is kept - detailed token-level logging was removed
 
         print("\n📊 Training Results:")
         metrics = {
@@ -971,14 +965,14 @@ def validate(
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...")
 
-        all_rewards = []
-        all_gen_lengths = []
+        # Collect validation data as lists for proper aggregation
+        all_rewards = []  # Individual rewards (not tensors)
+        all_gen_lengths = []  # Individual generation lengths
         all_prompt_lengths = []
         all_prompt_ids = []
         all_extra_env_info = []
         all_loss_multipliers = []
-        # ADDED: Collect all message logs to print better samples
-        all_message_logs = []
+        all_message_logs = []  # For convenient logging and sample display
 
         max_batches = (
             master_config["grpo"]["max_val_samples"]
@@ -1009,15 +1003,16 @@ def validate(
                     greedy=False,
                 )
 
-            all_rewards.append(val_batch["total_reward"])
-            all_gen_lengths.append(val_batch["generation_lengths"])
-            all_prompt_lengths.append(val_batch["length"])
+            # Extend lists with individual values (not append tensors)
+            all_rewards.extend(val_batch["total_reward"].tolist())
+            all_gen_lengths.extend(val_batch["generation_lengths"].tolist())
+            all_prompt_lengths.extend(val_batch["length"].tolist())
             all_prompt_ids.extend(val_batch["idx"])
-            all_loss_multipliers.append(val_batch["loss_multiplier"])
+            all_loss_multipliers.extend(val_batch["loss_multiplier"].tolist())
             if has_global_metrics:
                 all_extra_env_info.extend(val_batch["extra_env_info"])
             
-            # ADDED: Collect message logs from all batches
+            # Extract message logs for convenient logging
             to_env = [
                 get_keys_from_message_log(val_batch["message_log"][i], ["role", "content"])
                 for i in range(len(val_batch["message_log"]))
@@ -1028,12 +1023,12 @@ def validate(
             print("  ⚠️ No samples processed during validation, skipping metrics calculation.")
             return {}, {}
 
-        final_rewards = torch.cat(all_rewards)
-        accuracy = final_rewards.mean().item()
+        # Calculate metrics from lists
+        accuracy = sum(all_rewards) / len(all_rewards)
         if master_config["grpo"].get("binarize_val_rewards", False):
-            accuracy = (final_rewards > 0).float().mean().item()
+            accuracy = sum(1 for r in all_rewards if r > 0) / len(all_rewards)
 
-        avg_length = torch.cat(all_gen_lengths).float().mean().item()
+        avg_length = sum(all_gen_lengths) / len(all_gen_lengths)
 
         val_metrics = {
             "accuracy": accuracy,
@@ -1042,25 +1037,64 @@ def validate(
 
         if has_global_metrics:
             print("▶ Calculating detailed validation environment metrics...")
+            # Convert lists to tensors for environment metrics calculation
             final_val_batch = BatchedDataDict({
-                "total_reward": final_rewards,
-                "loss_multiplier": torch.cat(all_loss_multipliers),
+                "total_reward": torch.tensor(all_rewards),
+                "loss_multiplier": torch.tensor(all_loss_multipliers),
                 "extra_env_info": all_extra_env_info,
-                "generation_lengths": torch.cat(all_gen_lengths),
-                "prompt_lengths": torch.cat(all_prompt_lengths),
+                "generation_lengths": torch.tensor(all_gen_lengths),
+                "prompt_lengths": torch.tensor(all_prompt_lengths),
                 "prompt_ids": all_prompt_ids,
             })
             _, env_metrics = ray.get(main_env.global_post_process_and_metrics.remote(final_val_batch))
             val_metrics.update(env_metrics)
 
-        # MODIFIED: Print samples using the collected logs and converting rewards to a list
+        # Log convenient validation data
+        try:
+            convenient_val_inputs = []
+            convenient_val_outputs = []
+            for conversation_turns in all_message_logs:
+                user_prompt = "ERROR: User prompt not found."
+                assistant_response = "ERROR: Assistant response not found."
+                for turn in conversation_turns:
+                    if turn.get("role") == "user":
+                        user_prompt = turn.get("content", "")
+                    elif turn.get("role") == "assistant":
+                        assistant_response = turn.get("content", "")
+                convenient_val_inputs.append(user_prompt)
+                convenient_val_outputs.append(assistant_response)
+            
+            num_samples = len(convenient_val_inputs)
+            if num_samples > 0:
+                convenient_val_log_data = {
+                    "step": [step] * num_samples,
+                    "input": convenient_val_inputs,
+                    "output": convenient_val_outputs,
+                    "reward": all_rewards,  # Already a list
+                }
+                logger.log_batched_dict_as_jsonl(
+                    convenient_val_log_data,
+                    f"val_data_convenient_{step}.jsonl"
+                )
+                num_small_samples = 32
+                first_32_log_data = {
+                    key: value[:num_small_samples] for key, value in convenient_val_log_data.items()
+                }
+                logger.log_batched_dict_as_jsonl(
+                    first_32_log_data,
+                    f"val_data_convenient_{step}_first_32.jsonl"
+                )
+        except Exception as e:
+            print(f"⚠️ Error logging convenient validation data for step {step}: {str(e)}. Continuing without convenient logging.")
+
+        # Print sample conversations with reward distribution statistics
         try:
             num_to_print = min(
                 master_config["logger"]["num_val_samples_to_print"], len(all_message_logs)
             )
             print_message_log_samples(
-                all_message_logs[:num_to_print],
-                final_rewards[:num_to_print].tolist(),  # Convert tensor to list
+                all_message_logs[:num_to_print],  # Only display a subset of conversations
+                all_rewards,  # Pass full rewards list to calculate correct distribution stats
                 num_samples=num_to_print,
                 step=step,
             )
@@ -1074,7 +1108,7 @@ def validate(
     if "normalized_confidence_advantage" in val_metrics:
         print(f"    • Normalized Confidence Advantage: {val_metrics['normalized_confidence_advantage']:.4f}")
     print(f"    • Average response length: {val_metrics.get('avg_length', 0):.1f} tokens")
-    print(f"    • Samples processed: {len(final_rewards)}")
+    print(f"    • Samples processed: {len(all_rewards)}")
     print("\n  ⏱️  Validation Timing:")
     print(f"    • Total validation time: {timing_metrics.get('total_validation_time', 0):.2f}s")
     

@@ -16,9 +16,9 @@ from pathlib import Path
 from typing import Any, Optional, Tuple, TypedDict, TypeVar, cast
 
 import numpy as np
-import ray
-import torch
-from torchdata.stateful_dataloader import StatefulDataLoader
+import ray  # type: ignore
+import torch  # type: ignore
+from torchdata.stateful_dataloader import StatefulDataLoader  # type: ignore
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.interfaces import LossFunction
@@ -165,9 +165,7 @@ def setup(
     # ==========================
     checkpointer = CheckpointManager(master_config["checkpointing"])
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    grpo_save_state: Optional[GRPOSaveState] = checkpointer.load_training_info(
-        last_checkpoint_path
-    )
+    grpo_save_state: Optional[GRPOSaveState] = cast(GRPOSaveState, checkpointer.load_training_info(last_checkpoint_path))
     if grpo_save_state is None:
         grpo_save_state = _default_grpo_save_state()
 
@@ -631,7 +629,7 @@ def grpo_train(
                 baseline, std = calculate_baseline_and_std_per_prompt(
                     prompt_ids,  # Now using only prompt tokens
                     rewards,
-                    torch.ones_like(rewards),
+                    repeated_batch["loss_multiplier"],
                     leave_one_out_baseline=master_config["grpo"][
                         "use_leave_one_out_baseline"
                     ],

@@ -1093,7 +1093,7 @@ def validate(
                 master_config["logger"]["num_val_samples_to_print"], len(all_message_logs)
             )
             print_message_log_samples(
-                all_message_logs[:num_to_print],  # Only display a subset of conversations
+                all_message_logs,  # Pass full message logs - function will sample internally
                 all_rewards,  # Pass full rewards list to calculate correct distribution stats
                 num_samples=num_to_print,
                 step=step,

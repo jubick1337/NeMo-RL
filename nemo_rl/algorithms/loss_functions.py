@@ -127,14 +127,17 @@ class ClippedPGLossFn(LossFunction):
         seq_index = data.get("seq_index", None)
 
         mask = token_mask * sample_mask.unsqueeze(-1)
+        
+        # Create a device-safe mask once to handle DTensor compatibility
+        safe_mask = mask.to(next_token_logits.device)
 
         # token_mult_prob_error
         # See more details and other metrics in docs/guides/grpo.md#metrics
         lp_error = torch.abs(generation_logprobs - prev_logprobs)  # noqa: F841  (precommit ignore for now)
         # average over all tokens in the microbatch
         mult_prob_error = masked_mean(
-            torch.exp(lp_error * mask),
-            mask,
+            torch.exp(lp_error * safe_mask),
+            safe_mask,
             global_normalization_factor=global_valid_toks,
         ).item()
 
@@ -190,7 +193,7 @@ class ClippedPGLossFn(LossFunction):
             )
             if self.loss_type == LossType.TOKEN_LEVEL:
                 kl = masked_mean(
-                    kl, mask, global_normalization_factor=global_valid_toks
+                    kl, safe_mask, global_normalization_factor=global_valid_toks
                 )
             else:
                 kl = masked_mean(
@@ -223,7 +226,7 @@ class ClippedPGLossFn(LossFunction):
                 # Mean PPO ratio
                 ppo_ratio_mean = masked_mean(
                     ratios.detach(),
-                    mask,
+                    safe_mask,
                     global_normalization_factor=global_valid_toks,
                 ).item()
                 
@@ -231,7 +234,7 @@ class ClippedPGLossFn(LossFunction):
                 clipped = (ratios != ratios_clamped).float()
                 ppo_fraction_clipped = masked_mean(
                     clipped,
-                    mask,
+                    safe_mask,
                     global_normalization_factor=global_valid_toks,
                 ).item()
             else:
@@ -261,7 +264,7 @@ class ClippedPGLossFn(LossFunction):
         if self.loss_type == LossType.TOKEN_LEVEL:
             actor_loss = masked_mean(
                 importance_weights_to_use * clip_loss,
-                mask,
+                safe_mask,
                 global_normalization_factor=global_valid_toks,
             )
         else:
@@ -278,7 +281,7 @@ class ClippedPGLossFn(LossFunction):
         # See: docs/guides/grpo.md#sampling-importance-ratio
         sample_importance_ratio = masked_mean(
             actor_importance_weights,
-            mask,
+            safe_mask,
             global_normalization_factor=global_valid_toks,
         )
 
@@ -287,7 +290,7 @@ class ClippedPGLossFn(LossFunction):
         with torch.no_grad():
             seq_entropy_approx = -masked_mean(
                 torch.exp(curr_logprobs - generation_logprobs) * curr_logprobs,
-                mask,
+                safe_mask,
                 global_normalization_factor=global_valid_toks,
             )
             
@@ -309,10 +312,7 @@ class ClippedPGLossFn(LossFunction):
                 # Calculate per-token entropy: -sum(p * log(p))
                 token_entropy = -torch.sum(probs_T * log_probs_T, dim=-1)
                 
-                # Move mask to the same device as token_entropy to handle DTensor case
-                safe_mask = mask.to(token_entropy.device)
-                
-                # Now use masked_mean with the device-compatible mask
+                # Now use masked_mean with the device-compatible mask (safe_mask already created at beginning)
                 temp_adj_entropy = masked_mean(
                     token_entropy,
                     safe_mask,
@@ -330,12 +330,12 @@ class ClippedPGLossFn(LossFunction):
         with torch.no_grad():
             probs_ratio = masked_mean(
                 ratios.detach(),
-                mask,
+                safe_mask,
                 global_normalization_factor=global_valid_toks,
             ).item()
             probs_ratio_clamped = masked_mean(
                 ratios_clamped.detach(),
-                mask,
+                safe_mask,
                 global_normalization_factor=global_valid_toks,
             ).item()
 

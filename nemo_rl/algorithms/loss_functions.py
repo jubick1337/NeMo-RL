@@ -291,29 +291,40 @@ class ClippedPGLossFn(LossFunction):
                 global_normalization_factor=global_valid_toks,
             )
             
-            # Calculate temperature-adjusted entropy
+            # Calculate temperature-adjusted entropy with error handling
             # H(P_T) = -sum(p_T(i) * log(p_T(i))) where p_T are temperature-scaled probabilities
-            # Remove last position's logits (same as done for curr_logprobs)
-            next_token_logits_wo_last = next_token_logits[:, :-1]
-            
-            # Apply temperature scaling
-            adjusted_logits = next_token_logits_wo_last / self.generation_temperature
-            
-            # Calculate temperature-scaled log probabilities
-            log_probs_T = torch.nn.functional.log_softmax(adjusted_logits, dim=-1)
-            
-            # Calculate temperature-scaled probabilities
-            probs_T = torch.exp(log_probs_T)
-            
-            # Calculate per-token entropy: -sum(p * log(p))
-            token_entropy = -torch.sum(probs_T * log_probs_T, dim=-1)
-            
-            # Average the per-token entropy across all valid tokens
-            temp_adj_entropy = masked_mean(
-                token_entropy,
-                mask,
-                global_normalization_factor=global_valid_toks,
-            )
+            try:
+                # Remove last position's logits (same as done for curr_logprobs)
+                next_token_logits_wo_last = next_token_logits[:, :-1]
+                
+                # Apply temperature scaling
+                adjusted_logits = next_token_logits_wo_last / self.generation_temperature
+                
+                # Calculate temperature-scaled log probabilities
+                log_probs_T = torch.nn.functional.log_softmax(adjusted_logits, dim=-1)
+                
+                # Calculate temperature-scaled probabilities
+                probs_T = torch.exp(log_probs_T)
+                
+                # Calculate per-token entropy: -sum(p * log(p))
+                token_entropy = -torch.sum(probs_T * log_probs_T, dim=-1)
+                
+                # Move mask to the same device as token_entropy to handle DTensor case
+                safe_mask = mask.to(token_entropy.device)
+                
+                # Now use masked_mean with the device-compatible mask
+                temp_adj_entropy = masked_mean(
+                    token_entropy,
+                    safe_mask,
+                    global_normalization_factor=global_valid_toks,
+                )
+                temp_adj_entropy_value = temp_adj_entropy.item()
+            except Exception as e:
+                # Log error but don't crash training
+                print(f"WARNING: Failed to calculate temperature_adjusted_entropy: {str(e)}")
+                print(f"         Continuing training without this metric.")
+                # Set to None to indicate calculation failed
+                temp_adj_entropy_value = None
 
         loss = actor_loss + kl
         with torch.no_grad():
@@ -342,7 +353,7 @@ class ClippedPGLossFn(LossFunction):
                 "sampling_importance_ratio": sample_importance_ratio.item(),
                 "num_valid_samples": sample_mask.sum().item(),
                 "approx_entropy": seq_entropy_approx.item(),
-                "temperature_adjusted_entropy": temp_adj_entropy.item(),
+                "temperature_adjusted_entropy": temp_adj_entropy_value,
                 "ppo_ratio_mean": ppo_ratio_mean,
                 "ppo_fraction_clipped": ppo_fraction_clipped,
             },

@@ -896,6 +896,16 @@ def grpo_train(
         }
         metrics.update(train_results["all_mb_metrics"])
         for k, v in metrics.items():
+            # Handle None values in metrics (e.g., from failed temperature_adjusted_entropy calculation)
+            if isinstance(v, list) and any(x is None for x in v):
+                # Filter out None values
+                filtered_v = [x for x in v if x is not None]
+                if not filtered_v:
+                    # If all values are None, skip this metric
+                    metrics[k] = None
+                    continue
+                v = filtered_v
+            
             if k in {"lr", "wd", "reward", "global_valid_seqs", "global_valid_toks"}:
                 metrics[k] = np.mean(v).item()
             else:
@@ -937,7 +947,9 @@ def grpo_train(
                 percent = (v / total_time * 100) if total_time > 0 else 0
                 print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
-        logger.log_metrics(metrics, step + 1, prefix="train")
+        # Filter out None values before logging
+        metrics_to_log = {k: v for k, v in metrics.items() if v is not None}
+        logger.log_metrics(metrics_to_log, step + 1, prefix="train")
         logger.log_metrics(timing_metrics, step + 1, prefix="timing/train")
 
         timer.reset()

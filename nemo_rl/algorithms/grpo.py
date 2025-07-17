@@ -78,6 +78,7 @@ class GRPOConfig(TypedDict):
     max_rollout_turns: int
     normalize_rewards: bool
     use_leave_one_out_baseline: bool
+    advantage_clip: float
     overlong_filtering: bool
     val_period: int
     val_batch_size: int
@@ -643,6 +644,16 @@ def grpo_train(
                         advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
                     )
                 
+                # --- START OF NEW FIX ---
+                # Store unclipped advantages for logging
+                unclipped_advantages = advantages.clone()
+                
+                clip_value = master_config["grpo"].get("advantage_clip", 0.0)
+                if clip_value > 0:
+                    print(f"▶ Clipping advantages to ±{clip_value}")
+                    advantages = torch.clamp(advantages, -clip_value, clip_value)
+                # --- END OF NEW FIX ---
+                
                 # Calculate debugging metrics for rewards and advantages
                 valid_mask = repeated_batch["loss_multiplier"] > 0
                 if valid_mask.any():
@@ -664,6 +675,18 @@ def grpo_train(
                         "advantage_max": valid_advantages.max().item(),
                         "advantage_min": valid_advantages.min().item(),
                     }
+                    
+                    # --- START OF NEW LOGIC ---
+                    # Conditionally add the un-clipped stats if clipping was active
+                    if clip_value > 0:
+                        valid_unclipped_advantages = unclipped_advantages[valid_mask].squeeze(-1)
+                        advantage_metrics.update({
+                            "unclipped_advantage_mean": valid_unclipped_advantages.mean().item(),
+                            "unclipped_advantage_std": valid_unclipped_advantages.std().item() if len(valid_unclipped_advantages) > 1 else 0.0,
+                            "unclipped_advantage_max": valid_unclipped_advantages.max().item(),
+                            "unclipped_advantage_min": valid_unclipped_advantages.min().item(),
+                        })
+                    # --- END OF NEW LOGIC ---
                 else:
                     # Default values if all samples are filtered
                     reward_metrics = {

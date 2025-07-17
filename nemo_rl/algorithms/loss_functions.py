@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import traceback
 from typing import Any, Optional, TypedDict, TypeVar
 
 import torch
@@ -136,7 +137,7 @@ class ClippedPGLossFn(LossFunction):
         lp_error = torch.abs(generation_logprobs - prev_logprobs)  # noqa: F841  (precommit ignore for now)
         # average over all tokens in the microbatch
         mult_prob_error = masked_mean(
-            torch.exp(lp_error * safe_mask),
+            torch.exp(lp_error),
             safe_mask,
             global_normalization_factor=global_valid_toks,
         ).item()
@@ -322,6 +323,8 @@ class ClippedPGLossFn(LossFunction):
             except Exception as e:
                 # Log error but don't crash training
                 print(f"WARNING: Failed to calculate temperature_adjusted_entropy: {str(e)}")
+                print(f"         Full traceback:")
+                traceback.print_exc()
                 print(f"         Continuing training without this metric.")
                 # Set to None to indicate calculation failed
                 temp_adj_entropy_value = None

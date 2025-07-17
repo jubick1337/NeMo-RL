@@ -20,6 +20,7 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+from nemo_rl.models.dtensor.parallelize import to_local_if_dtensor
 from nemo_rl.data import hf_datasets
 from nemo_rl.models.policy import TokenizerConfig
 
@@ -149,12 +150,15 @@ def masked_mean(
     global_normalization_factor: Optional[torch.Tensor | float] = None,
 ):
     """Computes the mean of a microbatch, using a global statistic as the normalization factor."""
+    # Convert DTensor to local tensor for compatibility with mask operations
+    values_local = to_local_if_dtensor(values)
+    
     normalization_factor = (
         torch.sum(mask, dim=dim)
         if global_normalization_factor is None
         else global_normalization_factor
     )
-    return torch.sum(values * mask, dim=dim) / (normalization_factor + 1e-8)
+    return torch.sum(values_local * mask, dim=dim) / (normalization_factor + 1e-8)
 
 
 def set_seed(seed: int) -> None:

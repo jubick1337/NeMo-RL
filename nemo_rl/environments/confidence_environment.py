@@ -69,7 +69,7 @@ class VerifyConfidenceWorker:
             last_think_token = re.search(r"</think>", response)
             if last_think_token:
                 response = response[
-                    : last_think_token.start()
+                    last_think_token.start() + len("</think>") :
                 ]  # We do not care what's inside of <think> </think>
             else:
                 results.append(

@@ -564,7 +564,10 @@ class DTensorPolicyWorker:
                             # Therefore, we only divide if we are NOT using the V1 engine.
                             use_v1_engine = os.environ.get('VLLM_USE_V1') == '1'
                             if not use_v1_engine:
+                                print(f"[Rank {self.rank}] Applying temperature scaling to logits with temperature {self.cfg['generation']['temperature']}")
                                 logits.div_(self.cfg["generation"]["temperature"])
+                            else:
+                                print(f"[Rank {self.rank}] Not applying temperature scaling to logits because V1 engine is used")
 
                         if self.cp_size > 1:
                             seq_index_dtensor = (

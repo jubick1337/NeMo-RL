@@ -507,6 +507,7 @@ def grpo_train(
             val_task_to_env,
             step=0,
             master_config=master_config,
+            logger=logger,
         )
         policy_generation.finish_generation()
         logger.log_metrics(val_metrics, step, prefix="validation")
@@ -602,6 +603,53 @@ def grpo_train(
                     zero_std_mask = std > 0
                     advantages[zero_std_mask] = (
                         advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
+                    )
+                try:
+                    complete_message_logs = [
+                        get_keys_from_message_log(message_log, ["role", "content"])
+                        for message_log in repeated_batch["message_log"]
+                    ]
+                    convenient_train_inputs = []
+                    convenient_train_outputs = []
+                    for conversation_turns in complete_message_logs:
+                        user_prompt = "ERROR: No user prompt found."
+                        assistant_response = "ERROR: No assistant response found."
+                        for turn in conversation_turns:
+                            if turn.get("role") == "user":
+                                user_prompt = turn.get("content")
+                            elif turn.get("role") == "assistant":
+                                assistant_response = turn.get("content")
+                        convenient_train_inputs.append(user_prompt)
+                        convenient_train_outputs.append(assistant_response)
+                    convenient_train_inputs = tokenizer.apply_chat_template(
+                        convenient_train_inputs, tokenize=False
+                    )
+                    num_samples = len(convenient_train_inputs)
+                    if num_samples > 0:
+                        convenient_train_log_data = {
+                            "step": [step + 1] * num_samples,
+                            "input": convenient_train_inputs,
+                            "output": convenient_train_outputs,
+                            "reward": rewards.tolist(),
+                        }
+                        logger.log_batched_dict_as_jsonl(
+                            convenient_train_log_data,
+                            f"train_data_convenient_step{step + 1}.jsonl",
+                        )
+                        num_small_samples = min(num_samples, 64)
+                        first_n_samples_log_data = {
+                            "step": [step + 1] * num_small_samples,
+                            "input": convenient_train_inputs[:num_small_samples],
+                            "output": convenient_train_outputs[:num_small_samples],
+                            "reward": rewards[:num_small_samples].tolist(),
+                        }
+                        logger.log_batched_dict_as_jsonl(
+                            first_n_samples_log_data,
+                            f"train_data_convenient_step{step + 1}_first_{num_small_samples}.jsonl",
+                        )
+                except Exception as e:
+                    print(
+                        f"⚠️ Error logging convenient training data for step {step + 1}: {str(e)}. Continuing without convenient logging."
                     )
 
             with timer.time("data_processing"):
@@ -708,6 +756,7 @@ def grpo_train(
                     val_task_to_env,
                     step=step + 1,
                     master_config=master_config,
+                    logger=logger,
                 )
                 policy_generation.finish_generation()
                 logger.log_metrics(
@@ -837,6 +886,7 @@ def validate(
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     step: int,
     master_config: MasterConfig,
+    logger: Logger,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run validation on the validation dataset."""
     if val_dataloader is None:
@@ -904,6 +954,49 @@ def validate(
             "accuracy": accuracy,
             "avg_length": avg_length,
         }
+
+        try:
+            convenient_val_inputs = []
+            convenient_val_outputs = []
+            for conversation_turns in all_message_logs:
+                user_prompt = "ERROR: No user prompt found."
+                assistant_response = "ERROR: No assistant response found."
+                for turn in conversation_turns:
+                    if turn.get("role") == "user":
+                        user_prompt = turn.get("content")
+                    elif turn.get("role") == "assistant":
+                        assistant_response = turn.get("content")
+                convenient_val_inputs.append(user_prompt)
+                convenient_val_outputs.append(assistant_response)
+            convenient_val_inputs = tokenizer.apply_chat_template(
+                convenient_val_inputs, tokenize=False
+            )
+            num_samples = len(convenient_val_inputs)
+            if num_samples > 0:
+                convenient_val_log_data = {
+                    "step": [step] * num_samples,
+                    "input": convenient_val_inputs,
+                    "output": convenient_val_outputs,
+                    "reward": total_rewards,
+                }
+                logger.log_batched_dict_as_jsonl(
+                    convenient_val_log_data, f"val_data_convenient_step{step}.jsonl"
+                )
+                num_small_samples = min(num_samples, 64)
+                first_n_samples_log_data = {
+                    "step": [step] * num_small_samples,
+                    "input": convenient_val_inputs[:num_small_samples],
+                    "output": convenient_val_outputs[:num_small_samples],
+                    "reward": total_rewards[:num_small_samples],
+                }
+                logger.log_batched_dict_as_jsonl(
+                    first_n_samples_log_data,
+                    f"val_data_convenient_step{step}_first_{num_small_samples}.jsonl",
+                )
+        except Exception as e:
+            print(
+                f"⚠️ Error logging convenient validation data for step {step}: {str(e)}. Continuing without convenient logging."
+            )
 
         # Print sample conversations only once at the end of validation
         try:

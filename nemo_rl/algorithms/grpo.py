@@ -605,10 +605,15 @@ def grpo_train(
                         advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
                     )
                 try:
+                    print(
+                        f"▶ Starting convenient training data logging for step {step + 1}..."
+                    )
                     complete_message_logs = [
                         get_keys_from_message_log(message_log, ["role", "content"])
                         for message_log in repeated_batch["message_log"]
                     ]
+                    print(f"  • Extracted {len(complete_message_logs)} message logs")
+
                     convenient_train_inputs = []
                     convenient_train_outputs = []
                     for conversation_turns in complete_message_logs:
@@ -621,11 +626,18 @@ def grpo_train(
                                 assistant_response = turn.get("content")
                         convenient_train_inputs.append(user_prompt)
                         convenient_train_outputs.append(assistant_response)
-                    convenient_train_inputs = tokenizer.apply_chat_template(
-                        convenient_train_inputs, tokenize=False
-                    )
+
                     num_samples = len(convenient_train_inputs)
+                    print(f"  • Collected {num_samples} user/assistant pairs")
+
                     if num_samples > 0:
+                        print(
+                            f"  • Sample of first input: {convenient_train_inputs[0][:100]}..."
+                        )
+                        print(
+                            f"  • Sample of first output: {convenient_train_outputs[0][:100]}..."
+                        )
+
                         convenient_train_log_data = {
                             "step": [step + 1] * num_samples,
                             "input": convenient_train_inputs,
@@ -636,6 +648,10 @@ def grpo_train(
                             convenient_train_log_data,
                             f"train_data_convenient_step{step + 1}.jsonl",
                         )
+                        print(
+                            f"  ✓ Logged full convenient training data ({num_samples} samples)"
+                        )
+
                         num_small_samples = min(num_samples, 64)
                         first_n_samples_log_data = {
                             "step": [step + 1] * num_small_samples,
@@ -646,6 +662,13 @@ def grpo_train(
                         logger.log_batched_dict_as_jsonl(
                             first_n_samples_log_data,
                             f"train_data_convenient_step{step + 1}_first_{num_small_samples}.jsonl",
+                        )
+                        print(
+                            f"  ✓ Logged first {num_small_samples} convenient training samples"
+                        )
+                    else:
+                        print(
+                            "  ⚠️ No samples found for convenient logging (num_samples=0)"
                         )
                 except Exception as e:
                     print(
@@ -956,8 +979,11 @@ def validate(
         }
 
         try:
+            print(f"\n▶ Starting convenient validation data logging for step {step}...")
             convenient_val_inputs = []
             convenient_val_outputs = []
+            print(f"  • Processing {len(all_message_logs)} message logs")
+
             for conversation_turns in all_message_logs:
                 user_prompt = "ERROR: No user prompt found."
                 assistant_response = "ERROR: No assistant response found."
@@ -968,11 +994,16 @@ def validate(
                         assistant_response = turn.get("content")
                 convenient_val_inputs.append(user_prompt)
                 convenient_val_outputs.append(assistant_response)
-            convenient_val_inputs = tokenizer.apply_chat_template(
-                convenient_val_inputs, tokenize=False
-            )
+
             num_samples = len(convenient_val_inputs)
+            print(f"  • Collected {num_samples} user/assistant pairs")
+
             if num_samples > 0:
+                print(f"  • Sample of first input: {convenient_val_inputs[0][:100]}...")
+                print(
+                    f"  • Sample of first output: {convenient_val_outputs[0][:100]}..."
+                )
+
                 convenient_val_log_data = {
                     "step": [step] * num_samples,
                     "input": convenient_val_inputs,
@@ -982,6 +1013,10 @@ def validate(
                 logger.log_batched_dict_as_jsonl(
                     convenient_val_log_data, f"val_data_convenient_step{step}.jsonl"
                 )
+                print(
+                    f"  ✓ Logged full convenient validation data ({num_samples} samples)"
+                )
+
                 num_small_samples = min(num_samples, 64)
                 first_n_samples_log_data = {
                     "step": [step] * num_small_samples,
@@ -992,6 +1027,13 @@ def validate(
                 logger.log_batched_dict_as_jsonl(
                     first_n_samples_log_data,
                     f"val_data_convenient_step{step}_first_{num_small_samples}.jsonl",
+                )
+                print(
+                    f"  ✓ Logged first {num_small_samples} convenient validation samples"
+                )
+            else:
+                print(
+                    "  ⚠️ No samples found for convenient validation logging (num_samples=0)"
                 )
         except Exception as e:
             print(

@@ -84,8 +84,8 @@ class GRPOConfig(TypedDict):
     val_batch_size: int
     val_at_start: bool
     max_val_samples: int
-    overlong_filtering: bool
     seed: int
+    overlong_filtering: NotRequired[bool]
 
 
 class GRPOSaveState(TypedDict):
@@ -627,7 +627,10 @@ def grpo_train(
                     )
 
             with timer.time("data_processing"):
-                use_overlong_filtering = master_config["grpo"]["overlong_filtering"]
+                use_overlong_filtering = master_config["grpo"].get(
+                    "overlong_filtering", False
+                )
+                truncated_present = "truncated" in repeated_batch
                 if use_overlong_filtering and "truncated" in repeated_batch:
                     loss_multiplier = repeated_batch["loss_multiplier"].clone()
                     truncated = repeated_batch["truncated"]
@@ -639,11 +642,21 @@ def grpo_train(
                     repeated_batch["loss_multiplier"] = loss_multiplier
                 # Add loss mask and advantages to each message in LLMMessageLogType
                 for i, message_log in enumerate(repeated_batch["message_log"]):
+                    overlong_filtered = (
+                        use_overlong_filtering
+                        and truncated_present
+                        and repeated_batch["truncated"][i]
+                    )
                     for j, message in enumerate(message_log):
                         if message["role"] == "assistant":
-                            message["token_loss_mask"] = torch.ones_like(
-                                message["token_ids"]
-                            )
+                            if overlong_filtered:
+                                message["token_loss_mask"] = torch.zeros_like(
+                                    message["token_ids"]
+                                )
+                            else:
+                                message["token_loss_mask"] = torch.ones_like(
+                                    message["token_ids"]
+                                )
                         else:
                             message["token_loss_mask"] = torch.zeros_like(
                                 message["token_ids"]

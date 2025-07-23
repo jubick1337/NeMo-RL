@@ -65,7 +65,6 @@ from nemo_rl.models.policy.utils import (
     get_gpu_info,
     get_runtime_env_for_policy_worker,
     import_class_from_path,
-    is_vllm_v1_engine_enabled,
     sliding_window_overwrite,
 )
 from nemo_rl.utils.native_checkpoint import (
@@ -426,8 +425,14 @@ class DTensorPolicyWorker:
             # The V1 engine returns raw logits before temperature scaling.
             # The V0 engine returns scaled logits.
             # Therefore, we only divide if we are not using the V1 engine.
-            if not is_vllm_v1_engine_enabled():
-                logits.div_(self.cfg["generation"]["temperature"])
+            print(
+                "Applying temperature scaling to logits, because VLLM_USE_V1 is not 1"
+            )
+            logits.div_(self.cfg["generation"]["temperature"])
+        else:
+            print(
+                "Not applying temperature scaling to logits, because VLLM_USE_V1 is 1"
+            )
         return logits
 
     @staticmethod

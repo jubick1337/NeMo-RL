@@ -226,8 +226,21 @@ class ConfidenceEnvironment(EnvironmentInterface):
             rewards == self.reward_scheme["reward_incorrect_high"]
         ).sum().item()
 
-        # Treat no_confidence as incorrect for balanced normalization
-        norm_coef = min(overall_correct, len(rewards) - overall_correct)
+        # Use valid_mask instead of all rewards
+        valid_mask = rewards != self.reward_scheme["reward_no_confidence"]
+        overall_correct_valid = (
+            (rewards == self.reward_scheme["reward_correct_high"]) & valid_mask
+        ).sum().item() + (
+            (rewards == self.reward_scheme["reward_correct_low"]) & valid_mask
+        ).sum().item()
+        overall_incorrect_valid = (
+            (rewards == self.reward_scheme["reward_incorrect_high"]) & valid_mask
+        ).sum().item() + (
+            (rewards == self.reward_scheme["reward_incorrect_low"]) & valid_mask
+        ).sum().item()
+
+        # Use valid samples only for normalization coefficient
+        norm_coef = min(overall_correct_valid, overall_incorrect_valid)
         nca = 1.0 - (inadequate_confidence / norm_coef) if norm_coef > 0 else 0.0
 
         # Calculate fractions

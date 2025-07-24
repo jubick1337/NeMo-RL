@@ -210,9 +210,6 @@ class ConfidenceEnvironment(EnvironmentInterface):
         ).sum().item() + (
             rewards == self.reward_scheme["reward_incorrect_low"]
         ).sum().item()
-        no_confidence = (
-            (rewards == self.reward_scheme["reward_no_confidence"]).sum().item()
-        )
 
         # Calculate accuracies with safety checks
         completed = overall_correct + overall_incorrect
@@ -228,8 +225,9 @@ class ConfidenceEnvironment(EnvironmentInterface):
         ).sum().item() + (
             rewards == self.reward_scheme["reward_incorrect_high"]
         ).sum().item()
+
         # Treat no_confidence as incorrect for balanced normalization
-        norm_coef = min(overall_correct, overall_incorrect + no_confidence)
+        norm_coef = min(overall_correct, len(rewards) - overall_correct)
         nca = 1.0 - (inadequate_confidence / norm_coef) if norm_coef > 0 else 0.0
 
         # Calculate fractions

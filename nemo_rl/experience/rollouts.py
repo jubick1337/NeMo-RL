@@ -832,6 +832,10 @@ def run_async_multi_turn_rollout(
             }
         )
 
+        # Preserve loss_multiplier from original input_batch if it exists
+        if "loss_multiplier" in input_batch:
+            final_batch["loss_multiplier"] = input_batch["loss_multiplier"]
+
         # Preserve additional fields from the original input_batch
         for key in input_batch.keys():
             if key not in final_batch:

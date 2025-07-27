@@ -507,6 +507,7 @@ def grpo_train(
             val_task_to_env,
             step=0,
             master_config=master_config,
+            logger=logger,
         )
         policy_generation.finish_generation()
         logger.log_metrics(val_metrics, step, prefix="validation")
@@ -580,6 +581,45 @@ def grpo_train(
                     )
                 policy_generation.finish_generation()
 
+            # Calculate environment metrics if supported
+            print("▶ Calculating environment metrics...")
+            env_metrics = {}
+            with timer.time("env_metrics_calculation"):
+                if task_to_env:
+                    main_env = next(iter(task_to_env.values()))
+                    if hasattr(main_env, "global_post_process_and_metrics"):
+                        # Note: generation_lengths is added by rollout functions
+                        metrics_batch = BatchedDataDict(
+                            {
+                                "rewards": repeated_batch[
+                                    "total_reward"
+                                ],  # Use 'rewards' not 'total_reward'
+                                "loss_multiplier": repeated_batch["loss_multiplier"],
+                                "extra_env_info": repeated_batch["extra_env_info"],
+                                "generation_lengths": repeated_batch[
+                                    "generation_lengths"
+                                ],
+                                "prompt_lengths": repeated_batch["length"],
+                                "prompt_ids": repeated_batch["idx"],
+                            }
+                        )
+                        try:
+                            _, env_metrics = ray.get(
+                                main_env.global_post_process_and_metrics.remote(
+                                    metrics_batch
+                                )
+                            )
+                        except Exception as e:
+                            print(
+                                f"⚠️  Error calling global_post_process_and_metrics: {e}"
+                            )
+                            print("⚠️  Continuing without environment-specific metrics.")
+                            env_metrics = {}
+                    else:
+                        print(
+                            "⚠️  Environment does not have global_post_process_and_metrics method."
+                        )
+
             # Calculate rewards & advantages
             print("▶ Processing rewards...")
             with timer.time("reward_calculation"):
@@ -602,6 +642,58 @@ def grpo_train(
                     zero_std_mask = std > 0
                     advantages[zero_std_mask] = (
                         advantages[zero_std_mask] / std.unsqueeze(-1)[zero_std_mask]
+                    )
+                try:
+                    complete_message_logs = [
+                        get_keys_from_message_log(message_log, ["role", "content"])
+                        for message_log in repeated_batch["message_log"]
+                    ]
+
+                    convenient_train_inputs = []
+                    convenient_train_outputs = []
+                    for conversation_turns in complete_message_logs:
+                        user_prompt = "ERROR: No user prompt found."
+                        assistant_response = "ERROR: No assistant response found."
+                        for turn in conversation_turns:
+                            if turn.get("role") == "user":
+                                user_prompt = turn.get("content")
+                            elif turn.get("role") == "assistant":
+                                assistant_response = turn.get("content")
+                        convenient_train_inputs.append(user_prompt)
+                        convenient_train_outputs.append(assistant_response)
+
+                    num_samples = len(convenient_train_inputs)
+
+                    if num_samples > 0:
+                        convenient_train_log_data = {
+                            "step": [step + 1] * num_samples,
+                            "input": convenient_train_inputs,
+                            "output": convenient_train_outputs,
+                            "reward": rewards.tolist(),
+                        }
+                        logger.log_batched_dict_as_jsonl(
+                            convenient_train_log_data,
+                            f"train_data_convenient_step{step + 1}.jsonl",
+                        )
+
+                        num_small_samples = min(num_samples, 64)
+                        first_n_samples_log_data = {
+                            "step": [step + 1] * num_small_samples,
+                            "input": convenient_train_inputs[:num_small_samples],
+                            "output": convenient_train_outputs[:num_small_samples],
+                            "reward": rewards[:num_small_samples].tolist(),
+                        }
+                        logger.log_batched_dict_as_jsonl(
+                            first_n_samples_log_data,
+                            f"train_data_convenient_step{step + 1}_first_{num_small_samples}.jsonl",
+                        )
+                    else:
+                        print(
+                            "  ⚠️ No samples found for convenient logging (num_samples=0)"
+                        )
+                except Exception as e:
+                    print(
+                        f"⚠️ Error logging convenient training data for step {step + 1}: {str(e)}. Continuing without convenient logging."
                     )
 
             with timer.time("data_processing"):
@@ -664,6 +756,16 @@ def grpo_train(
                         "sample_mask": repeated_batch["loss_multiplier"],
                     }
                 )
+
+                # DEBUG: Inspect generation_logprobs before loss
+                gen_lp = train_data["generation_logprobs"]
+                mean_gen_lp = gen_lp.mean().item()
+                std_gen_lp = gen_lp.std().item()
+                num_zeros = (gen_lp == 0).sum().item()
+                print(
+                    f"DEBUG_ENTROPY: generation_logprobs mean={mean_gen_lp:.4f}, std={std_gen_lp:.4f}, num_zeros={num_zeros}/{gen_lp.numel()}"
+                )
+
                 train_data.to("cpu")
 
             print("▶ Preparing for logprob inference...")
@@ -708,6 +810,7 @@ def grpo_train(
                     val_task_to_env,
                     step=step + 1,
                     master_config=master_config,
+                    logger=logger,
                 )
                 policy_generation.finish_generation()
                 logger.log_metrics(
@@ -725,6 +828,11 @@ def grpo_train(
 
                 grpo_save_state["step"] = step + 1
                 if val_metrics is not None:
+                    # Save the specified metric if available, otherwise fall back to accuracy
+                    metric_name = master_config["checkpointing"]["metric_name"]
+                    if metric_name and metric_name in val_metrics:
+                        grpo_save_state[metric_name] = val_metrics[metric_name]
+                    # Always save accuracy for backward compatibility
                     grpo_save_state["val_reward"] = val_metrics["accuracy"]
                 elif "val_reward" in grpo_save_state:
                     del grpo_save_state["val_reward"]
@@ -784,6 +892,10 @@ def grpo_train(
                 metrics[k] = np.sum(v).item()
         metrics.update(rollout_metrics)
 
+        # Add environment-specific metrics if available
+        if env_metrics:
+            metrics.update(env_metrics)
+
         timing_metrics: dict[str, float] = timer.get_timing_metrics(reduction_op="sum")  # type: ignore
         # track example with high token mult prob error above 1.05
         if metrics["token_mult_prob_error"] > 1.05:
@@ -837,6 +949,7 @@ def validate(
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     step: int,
     master_config: MasterConfig,
+    logger: Logger,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run validation on the validation dataset."""
     if val_dataloader is None:
@@ -847,9 +960,20 @@ def validate(
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...")
 
-        total_rewards = []
-        total_lengths = []
-        all_message_logs = []  # Collect all message logs
+        # Check if environment supports global metrics
+        main_env = next(iter(val_task_to_env.values())) if val_task_to_env else None
+        has_global_metrics = main_env and hasattr(
+            main_env, "global_post_process_and_metrics"
+        )
+
+        # Collect validation data as lists for proper aggregation
+        all_rewards = []  # Individual rewards (not tensors)
+        all_gen_lengths = []  # Individual generation lengths
+        all_prompt_lengths = []
+        all_prompt_ids = []
+        all_extra_env_info = []
+        all_loss_multipliers = []
+        all_message_logs = []  # For convenient logging and sample display
 
         max_batches = (
             master_config["grpo"]["max_val_samples"]
@@ -883,8 +1007,14 @@ def validate(
                 )
             rewards = val_batch["total_reward"]
 
-            total_rewards.extend(rewards.tolist())
-            total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
+            # Extend lists with individual values (not append tensors)
+            all_rewards.extend(rewards.tolist())
+            all_gen_lengths.extend(val_batch["generation_lengths"].tolist())
+            all_prompt_lengths.extend(val_batch["length"].tolist())
+            all_prompt_ids.extend(val_batch["idx"])
+            all_loss_multipliers.extend(val_batch["loss_multiplier"].tolist())
+            if has_global_metrics:
+                all_extra_env_info.extend(val_batch["extra_env_info"])
 
             # Collect message logs for later display
             to_env = [
@@ -896,20 +1026,101 @@ def validate(
 
             all_message_logs.extend(to_env)
 
+        if not all_rewards:
+            print(
+                "  ⚠️ No samples processed during validation, skipping metrics calculation."
+            )
+            return {}, {}
+
         # Calculate validation metrics
-        accuracy = sum(total_rewards) / len(total_rewards)
-        avg_length = sum(total_lengths) / len(total_lengths)
+        accuracy = sum(all_rewards) / len(all_rewards)
+        avg_length = sum(all_gen_lengths) / len(all_gen_lengths)
 
         val_metrics = {
             "accuracy": accuracy,
             "avg_length": avg_length,
         }
 
+        # Call global_post_process_and_metrics if available
+        if has_global_metrics:
+            print("▶ Calculating detailed validation environment metrics...")
+            # Convert lists to tensors for environment metrics calculation
+            final_val_batch = BatchedDataDict(
+                {
+                    "rewards": torch.tensor(
+                        all_rewards
+                    ),  # Use 'rewards' not 'total_reward'
+                    "loss_multiplier": torch.tensor(all_loss_multipliers),
+                    "extra_env_info": all_extra_env_info,
+                    "generation_lengths": torch.tensor(all_gen_lengths),
+                    "prompt_lengths": torch.tensor(all_prompt_lengths),
+                    "prompt_ids": all_prompt_ids,
+                }
+            )
+            try:
+                _, env_metrics = ray.get(
+                    main_env.global_post_process_and_metrics.remote(final_val_batch)
+                )
+                val_metrics.update(env_metrics)
+            except Exception as e:
+                print(
+                    f"⚠️  Error calling global_post_process_and_metrics during validation: {e}"
+                )
+                print("⚠️  Continuing without environment-specific validation metrics.")
+
+        try:
+            convenient_val_inputs = []
+            convenient_val_outputs = []
+
+            for conversation_turns in all_message_logs:
+                user_prompt = "ERROR: No user prompt found."
+                assistant_response = "ERROR: No assistant response found."
+                for turn in conversation_turns:
+                    if turn.get("role") == "user":
+                        user_prompt = turn.get("content")
+                    elif turn.get("role") == "assistant":
+                        assistant_response = turn.get("content")
+                convenient_val_inputs.append(user_prompt)
+                convenient_val_outputs.append(assistant_response)
+
+            num_samples = len(convenient_val_inputs)
+
+            if num_samples > 0:
+                convenient_val_log_data = {
+                    "step": [step] * num_samples,
+                    "input": convenient_val_inputs,
+                    "output": convenient_val_outputs,
+                    "reward": all_rewards,
+                }
+                logger.log_batched_dict_as_jsonl(
+                    convenient_val_log_data, f"val_data_convenient_step{step}.jsonl"
+                )
+
+                num_small_samples = min(num_samples, 64)
+                first_n_samples_log_data = {
+                    "step": [step] * num_small_samples,
+                    "input": convenient_val_inputs[:num_small_samples],
+                    "output": convenient_val_outputs[:num_small_samples],
+                    "reward": all_rewards[:num_small_samples],
+                }
+                logger.log_batched_dict_as_jsonl(
+                    first_n_samples_log_data,
+                    f"val_data_convenient_step{step}_first_{num_small_samples}.jsonl",
+                )
+            else:
+                print(
+                    "  ⚠️ No samples found for convenient validation logging (num_samples=0)"
+                )
+        except Exception as e:
+            print(
+                f"⚠️ Error logging convenient validation data for step {step}: {str(e)}. Continuing without convenient logging."
+            )
+
         # Print sample conversations only once at the end of validation
         try:
             print_message_log_samples(
                 all_message_logs,
-                total_rewards,
+                all_rewards,
                 num_samples=min(
                     master_config["logger"]["num_val_samples_to_print"],
                     len(all_message_logs),
@@ -928,7 +1139,7 @@ def validate(
     print("\n📊 Validation Results:")
     print(f"    • Accuracy: {accuracy:.4f}")
     print(f"    • Average response length: {avg_length:.1f} tokens")
-    print(f"    • Samples processed: {len(total_rewards)}")
+    print(f"    • Samples processed: {len(all_rewards)}")
 
     # Print timing information
     print("\n  ⏱️  Validation Timing:")

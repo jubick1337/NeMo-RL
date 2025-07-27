@@ -473,6 +473,9 @@ def run_multi_turn_rollout(
     # Add total rewards to the final batch
     current_batch["total_reward"] = total_rewards
     current_batch["truncated"] = sample_truncated
+    current_batch["generation_lengths"] = (
+        sample_assistant_token_counts  # Total assistant tokens per sample
+    )
 
     # Calculate aggregate metrics
     rollout_metrics = {
@@ -822,8 +825,16 @@ def run_async_multi_turn_rollout(
                     [metrics["truncated"] for metrics in all_sample_metrics],
                     dtype=torch.bool,
                 ),
+                "generation_lengths": torch.tensor(
+                    [metrics["assistant_tokens"] for metrics in all_sample_metrics],
+                    dtype=torch.long,
+                ),  # Total assistant tokens per sample
             }
         )
+
+        # Preserve loss_multiplier from original input_batch if it exists
+        if "loss_multiplier" in input_batch:
+            final_batch["loss_multiplier"] = input_batch["loss_multiplier"]
 
         # Preserve additional fields from the original input_batch
         for key in input_batch.keys():

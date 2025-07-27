@@ -266,10 +266,26 @@ class ClippedPGLossFn(LossFunction):
         # Approximating entropy as E_{s ~ \pi_{gen}(s)}[-(\pi_{curr}/\pi_{gen})log(\pi_{curr}(s))]
         # See more details and other metrics in docs/guides/grpo.md#metrics
         with torch.no_grad():
+            # DEBUG: Before entropy calc
+            ratio = curr_logprobs - generation_logprobs
+            exp_ratio = torch.exp(ratio)
+            entropy_terms = exp_ratio * curr_logprobs
+            print(
+                f"DEBUG_ENTROPY: curr_logprobs mean={curr_logprobs.mean().item():.4f}, generation_logprobs mean={generation_logprobs.mean().item():.4f}"
+            )
+            print(
+                f"DEBUG_ENTROPY: exp(ratio) mean={exp_ratio.mean().item():.4f}, entropy_terms mean={entropy_terms.mean().item():.4f}"
+            )
+
             seq_entropy_approx = -masked_mean(
                 torch.exp(curr_logprobs - generation_logprobs) * curr_logprobs,
                 mask,
                 global_normalization_factor=global_valid_toks,
+            )
+
+            # DEBUG: After calc
+            print(
+                f"DEBUG_ENTROPY: Computed approx_entropy={seq_entropy_approx.item():.4f}"
             )
 
         loss = actor_loss + kl

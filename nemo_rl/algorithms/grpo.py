@@ -756,6 +756,16 @@ def grpo_train(
                         "sample_mask": repeated_batch["loss_multiplier"],
                     }
                 )
+
+                # DEBUG: Inspect generation_logprobs before loss
+                gen_lp = train_data["generation_logprobs"]
+                mean_gen_lp = gen_lp.mean().item()
+                std_gen_lp = gen_lp.std().item()
+                num_zeros = (gen_lp == 0).sum().item()
+                print(
+                    f"DEBUG_ENTROPY: generation_logprobs mean={mean_gen_lp:.4f}, std={std_gen_lp:.4f}, num_zeros={num_zeros}/{gen_lp.numel()}"
+                )
+
                 train_data.to("cpu")
 
             print("▶ Preparing for logprob inference...")

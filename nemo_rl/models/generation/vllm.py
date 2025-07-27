@@ -468,6 +468,11 @@ class VllmGenerationWorker:
             stop_strings=stop_strings,
         )
 
+        # DEBUG: Print sampling params to confirm logprobs value
+        print(
+            f"DEBUG_ENTROPY: SamplingParams: logprobs={sampling_params.logprobs}, temperature={sampling_params.temperature}"
+        )
+
         # verify inputs have correct padding
         verify_right_padding(data, pad_value=self.cfg["pad_token_id"])
 
@@ -494,6 +499,16 @@ class VllmGenerationWorker:
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
         outputs = self.llm.generate(prompts, sampling_params)
+
+        # DEBUG: Check if vLLM returned actual logprobs
+        sample_idx = 0  # Check first sample
+        gen = outputs[sample_idx].outputs[0]
+        has_logprobs = (
+            hasattr(gen, "logprobs") and gen.logprobs and len(gen.logprobs) > 0
+        )
+        print(
+            f"DEBUG_ENTROPY: vLLM returned logprobs? {has_logprobs}. Sample logprobs length: {len(gen.logprobs) if has_logprobs else 0}"
+        )
 
         # Process the outputs - but preserve the original input padding structure
         output_ids_list = []
@@ -540,6 +555,14 @@ class VllmGenerationWorker:
                     import traceback
 
                     traceback.print_exc()
+
+            # DEBUG: Inspect logprobs after filling (check if zero-filled)
+            if i == 0:  # First sample only for brevity
+                mean_logprob = full_logprobs.mean().item()
+                num_zeros = (full_logprobs == 0).sum().item()
+                print(
+                    f"DEBUG_ENTROPY: Sample {i} logprobs mean={mean_logprob:.4f}, num_zeros={num_zeros}/{full_logprobs.numel()}"
+                )
 
             logprobs_list.append(full_logprobs)
 

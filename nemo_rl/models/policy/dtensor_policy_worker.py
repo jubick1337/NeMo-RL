@@ -427,18 +427,7 @@ class DTensorPolicyWorker:
             # The V0 engine returns scaled logits.
             # Therefore, we only divide if we are not using the V1 engine.
             if not is_vllm_v1_engine_enabled():
-                print(
-                    f"Applying temperature scaling to logits (dividing by {self.cfg['generation']['temperature']}), "
-                    "because vLLM V0 is being used (NRL_VLLM_USE_V1 != 1)"
-                )
                 logits.div_(self.cfg["generation"]["temperature"])
-            else:
-                print(
-                    "NOT applying temperature scaling to logits, "
-                    "because vLLM V1 is being used (NRL_VLLM_USE_V1 == 1)"
-                )
-        else:
-            print("No generation config found, skipping temperature scaling")
         return logits
 
     @staticmethod

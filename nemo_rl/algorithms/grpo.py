@@ -697,9 +697,7 @@ def grpo_train(
                     )
 
             with timer.time("data_processing"):
-                use_overlong_filtering = master_config["grpo"].get(
-                    "overlong_filtering", False
-                )
+                use_overlong_filtering = master_config["grpo"]["overlong_filtering"]
                 if use_overlong_filtering and "truncated" in repeated_batch:
                     loss_multiplier = repeated_batch["loss_multiplier"].clone()
                     truncated = repeated_batch["truncated"]

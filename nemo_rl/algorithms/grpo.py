@@ -711,19 +711,11 @@ def grpo_train(
                     repeated_batch["loss_multiplier"] = loss_multiplier
                 # Add loss mask and advantages to each message in LLMMessageLogType
                 for i, message_log in enumerate(repeated_batch["message_log"]):
-                    overlong_filtered = (
-                        use_overlong_filtering and repeated_batch["truncated"][i]
-                    )
                     for j, message in enumerate(message_log):
                         if message["role"] == "assistant":
-                            if overlong_filtered:
-                                message["token_loss_mask"] = torch.zeros_like(
-                                    message["token_ids"]
-                                )
-                            else:
-                                message["token_loss_mask"] = torch.ones_like(
-                                    message["token_ids"]
-                                )
+                            message["token_loss_mask"] = torch.ones_like(
+                                message["token_ids"]
+                            )
                         else:
                             message["token_loss_mask"] = torch.zeros_like(
                                 message["token_ids"]

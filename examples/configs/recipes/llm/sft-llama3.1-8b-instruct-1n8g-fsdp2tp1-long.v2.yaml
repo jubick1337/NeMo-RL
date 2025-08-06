@@ -14,6 +14,7 @@ checkpointing:
   higher_is_better: false
   keep_top_k: 3
   save_period: 10
+  checkpoint_must_save_by: null
 policy:
   model_name: meta-llama/Llama-3.1-8B-Instruct
   tokenizer:
@@ -57,6 +58,7 @@ data:
   add_bos: true
   add_eos: true
   add_generation_prompt: false
+  shuffle: true
 logger:
   log_dir: logs/sft-llama3.1-8b-instruct-1n8g-fsdp2tp1-long
   wandb_enabled: true
@@ -75,3 +77,4 @@ logger:
 cluster:
   gpus_per_node: 8
   num_nodes: 1
+

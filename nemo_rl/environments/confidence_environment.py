@@ -62,7 +62,10 @@ class VerifyConfidenceWorker:
             return -1.0
 
     def verify(
-        self, pred_responses: list[str], ground_truths: list[str], return_extracted_answer: bool = False
+        self,
+        pred_responses: list[str],
+        ground_truths: list[str],
+        return_extracted_answer: bool = False,
     ) -> Union[list[float], tuple[list[float], list[dict[str, str]]]]:
         results: list[float] = []
         extracted_answers: list[dict[str, str]] = []
@@ -79,9 +82,11 @@ class VerifyConfidenceWorker:
                 )  # No think token, assumes model didn't finish thinking or follow format
                 extracted_answers.append({"mathematical_answer": "", "confidence": ""})
                 continue
-            last_boxed_response = re.search(r"\\boxed{(.*?)}", response)
-            if last_boxed_response:
-                parseble_response = last_boxed_response.group(0)
+            # Find all boxed expressions and take the last one
+            boxed_matches = re.findall(r"\\boxed{(.*?)}", response)
+            if boxed_matches:
+                # Take the last boxed expression
+                parseble_response = f"\\boxed{{{boxed_matches[-1]}}}"
             else:
                 results.append(
                     self.reward_no_confidence
@@ -96,11 +101,11 @@ class VerifyConfidenceWorker:
                         [ground_truth_boxed], [parseble_response]
                     )
                     is_correct = float(ret_score) == 1.0
-                    
+
                     # Extract both mathematical answer and confidence
                     mathematical_answer = ""
                     confidence = ""
-                    
+
                     # Extract mathematical answer similar to math environment logic
                     if return_extracted_answer and extracted_answer_result is not None:
                         assert len(extracted_answer_result) == 2
@@ -108,25 +113,42 @@ class VerifyConfidenceWorker:
                         # Get the extracted answer with the same logic as in the HFVerifyWorker
                         answer_found = None
                         for pred in extracted_prediction:
-                            if any(grader.verify(gold, pred) for gold in extracted_gold):
+                            if any(
+                                grader.verify(gold, pred) for gold in extracted_gold
+                            ):
                                 answer_found = pred
                                 break
                         if answer_found is None and extracted_prediction:
                             # If no match is found, means all answers are incorrect, just use the first prediction
-                            answer_found = extracted_prediction[0][0] if extracted_prediction[0] else None
-                        mathematical_answer = answer_found if answer_found is not None else ""
-                    
+                            answer_found = (
+                                extracted_prediction[0][0]
+                                if extracted_prediction[0]
+                                else None
+                            )
+                        mathematical_answer = (
+                            answer_found if answer_found is not None else ""
+                        )
+
                     # Extract confidence level
                     if return_extracted_answer:
-                        confidence_match = re.search(r"\nConfidence: (.*?)(?:\n|$)", response)
+                        confidence_match = re.search(
+                            r"\nConfidence: (.*?)(?:\n|$)", response
+                        )
                         if confidence_match:
                             confidence = confidence_match.group(1).strip()
-                    
-                    extracted_answers.append({"mathematical_answer": mathematical_answer, "confidence": confidence})
-                        
+
+                    extracted_answers.append(
+                        {
+                            "mathematical_answer": mathematical_answer,
+                            "confidence": confidence,
+                        }
+                    )
+
                 except Exception as e:
                     is_correct = False  # Error in verification, assumes model didn't follow format
-                    extracted_answers.append({"mathematical_answer": "", "confidence": ""})
+                    extracted_answers.append(
+                        {"mathematical_answer": "", "confidence": ""}
+                    )
             confidence_level = self.parse_confidence_level(response)
             final_reward = 0.0
             if is_correct:
@@ -152,7 +174,7 @@ class VerifyConfidenceWorker:
                         f"Invalid confidence level: {confidence_level} with incorrect answer {ground_truth} and response {response}"
                     )
             results.append(final_reward)
-        
+
         if return_extracted_answer:
             return results, extracted_answers
         else:
@@ -205,13 +227,15 @@ class ConfidenceEnvironment(EnvironmentInterface):
         )
         chunked_ground_truths = chunk_list_to_workers(ground_truths, self.num_workers)
         futures = [
-            self.workers[i].verify.remote(chunk, ground_truth_chunk, return_extracted_answer)
+            self.workers[i].verify.remote(
+                chunk, ground_truth_chunk, return_extracted_answer
+            )
             for i, (chunk, ground_truth_chunk) in enumerate(
                 zip(chunked_assistant_response_batch, chunked_ground_truths)
             )
         ]
         worker_results = ray.get(futures)
-        
+
         # Flatten the results and extract both scores and answers
         results = []
         extracted_answers: list[dict[str, str]] | None = (

@@ -1,8 +1,9 @@
 import re
-from typing import Optional, TypedDict
+from typing import Optional, TypedDict, Union
 
 import ray
 import torch
+from math_verify import grader
 from math_verify.metric import math_metric
 from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
 
@@ -61,9 +62,10 @@ class VerifyConfidenceWorker:
             return -1.0
 
     def verify(
-        self, pred_responses: list[str], ground_truths: list[str]
-    ) -> list[float]:
+        self, pred_responses: list[str], ground_truths: list[str], return_extracted_answer: bool = False
+    ) -> Union[list[float], tuple[list[float], list[dict[str, str]]]]:
         results: list[float] = []
+        extracted_answers: list[dict[str, str]] = []
         for response, ground_truth in zip(pred_responses, ground_truths):
             is_correct = False
             last_think_token = re.search(r"</think>", response)
@@ -75,6 +77,7 @@ class VerifyConfidenceWorker:
                 results.append(
                     self.reward_no_confidence
                 )  # No think token, assumes model didn't finish thinking or follow format
+                extracted_answers.append({"mathematical_answer": "", "confidence": ""})
                 continue
             last_boxed_response = re.search(r"\\boxed{(.*?)}", response)
             if last_boxed_response:
@@ -83,17 +86,47 @@ class VerifyConfidenceWorker:
                 results.append(
                     self.reward_no_confidence
                 )  # No boxed response, assumes model didn't follow format
+                extracted_answers.append({"mathematical_answer": "", "confidence": ""})
                 continue
             with _mute_output():
                 try:
                     # Wrap ground truth in \boxed{} format for math verification
                     ground_truth_boxed = f"\\boxed{{{ground_truth}}}"
-                    ret_score, _ = self.verify_func(
+                    ret_score, extracted_answer_result = self.verify_func(
                         [ground_truth_boxed], [parseble_response]
                     )
                     is_correct = float(ret_score) == 1.0
+                    
+                    # Extract both mathematical answer and confidence
+                    mathematical_answer = ""
+                    confidence = ""
+                    
+                    # Extract mathematical answer similar to math environment logic
+                    if return_extracted_answer and extracted_answer_result is not None:
+                        assert len(extracted_answer_result) == 2
+                        extracted_gold, extracted_prediction = extracted_answer_result
+                        # Get the extracted answer with the same logic as in the HFVerifyWorker
+                        answer_found = None
+                        for pred in extracted_prediction:
+                            if any(grader.verify(gold, pred) for gold in extracted_gold):
+                                answer_found = pred
+                                break
+                        if answer_found is None and extracted_prediction:
+                            # If no match is found, means all answers are incorrect, just use the first prediction
+                            answer_found = extracted_prediction[0][0] if extracted_prediction[0] else None
+                        mathematical_answer = answer_found if answer_found is not None else ""
+                    
+                    # Extract confidence level
+                    if return_extracted_answer:
+                        confidence_match = re.search(r"\nConfidence: (.*?)(?:\n|$)", response)
+                        if confidence_match:
+                            confidence = confidence_match.group(1).strip()
+                    
+                    extracted_answers.append({"mathematical_answer": mathematical_answer, "confidence": confidence})
+                        
                 except Exception as e:
                     is_correct = False  # Error in verification, assumes model didn't follow format
+                    extracted_answers.append({"mathematical_answer": "", "confidence": ""})
             confidence_level = self.parse_confidence_level(response)
             final_reward = 0.0
             if is_correct:
@@ -119,7 +152,11 @@ class VerifyConfidenceWorker:
                         f"Invalid confidence level: {confidence_level} with incorrect answer {ground_truth} and response {response}"
                     )
             results.append(final_reward)
-        return results
+        
+        if return_extracted_answer:
+            return results, extracted_answers
+        else:
+            return results
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -168,13 +205,26 @@ class ConfidenceEnvironment(EnvironmentInterface):
         )
         chunked_ground_truths = chunk_list_to_workers(ground_truths, self.num_workers)
         futures = [
-            self.workers[i].verify.remote(chunk, ground_truth_chunk)
+            self.workers[i].verify.remote(chunk, ground_truth_chunk, return_extracted_answer)
             for i, (chunk, ground_truth_chunk) in enumerate(
                 zip(chunked_assistant_response_batch, chunked_ground_truths)
             )
         ]
-        results = ray.get(futures)
-        results = [item for sublist in results for item in sublist]
+        worker_results = ray.get(futures)
+        
+        # Flatten the results and extract both scores and answers
+        results = []
+        extracted_answers: list[dict[str, str]] | None = (
+            [] if return_extracted_answer else None
+        )
+
+        for worker_result in worker_results:
+            if return_extracted_answer:
+                worker_scores, worker_answers = worker_result
+                results.extend(worker_scores)
+                extracted_answers.extend(worker_answers)
+            else:
+                results.extend(worker_result)
         observations = [
             {
                 "role": "environment",
@@ -191,7 +241,7 @@ class ConfidenceEnvironment(EnvironmentInterface):
             next_stop_strings=next_stop_strings,
             rewards=rewards,
             terminateds=terminateds,
-            answers=[],
+            answers=extracted_answers,
         )
 
     def global_post_process_and_metrics(

@@ -44,14 +44,16 @@ class VerifyConfidenceWorker:
         )
 
     def parse_confidence_level(self, response: str) -> float:
-        """Returns 1.0 for high confidence, 0.0 for low confidence, and -1.0 for no confidence or invalid confidence level.
+        """Returns 1.0 for High, 0.0 for Low, and -1.0 for no/invalid confidence.
 
-        Checks for the last confidence level in the response, and returns the confidence level.
+        Matches lines that begin with 'Confidence:' (multiline), allowing leading
+        whitespace and only 'High' or 'Low' with no trailing text. Uses the last match.
         """
-        # Look for ALL confidence levels and take the last one
-        confidence_matches = re.findall(r"\nConfidence: (.*?)(?:\n|$)", response)
+        confidence_matches = re.findall(
+            r"(?m)^\s*Confidence:\s*(High|Low)\s*$", response
+        )
         if confidence_matches:
-            confidence_text = confidence_matches[-1].strip()
+            confidence_text = confidence_matches[-1]
             if confidence_text == "High":
                 return 1.0
             elif confidence_text == "Low":
@@ -82,11 +84,12 @@ class VerifyConfidenceWorker:
                 )  # No think token, assumes model didn't finish thinking or follow format
                 extracted_answers.append({"mathematical_answer": "", "confidence": ""})
                 continue
-            # Find all boxed expressions and take the last one
-            boxed_matches = re.findall(r"\\boxed{(.*?)}", response)
-            if boxed_matches:
-                # Take the last boxed expression
-                parseble_response = f"\\boxed{{{boxed_matches[-1]}}}"
+            # Find the last 'Answer: \\boxed{...}' line (line-anchored)
+            answer_iters = list(
+                re.finditer(r"(?m)^\s*Answer:\s*\\boxed{([^}]*)}\s*$", response)
+            )
+            if answer_iters:
+                parseble_response = f"\\boxed{{{answer_iters[-1].group(1)}}}"
             else:
                 results.append(
                     self.reward_no_confidence
@@ -129,13 +132,13 @@ class VerifyConfidenceWorker:
                             answer_found if answer_found is not None else ""
                         )
 
-                    # Extract confidence level
+                    # Extract confidence level (use last line-anchored 'Confidence: ...')
                     if return_extracted_answer:
-                        confidence_match = re.search(
-                            r"\nConfidence: (.*?)(?:\n|$)", response
+                        confidence_matches = re.findall(
+                            r"(?m)^\s*Confidence:\s*(High|Low)\s*$", response
                         )
-                        if confidence_match:
-                            confidence = confidence_match.group(1).strip()
+                        if confidence_matches:
+                            confidence = confidence_matches[-1]
 
                     extracted_answers.append(
                         {

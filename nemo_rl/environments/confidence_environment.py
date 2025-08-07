@@ -48,10 +48,10 @@ class VerifyConfidenceWorker:
 
         Checks for the last confidence level in the response, and returns the confidence level.
         """
-        # Look for confidence level exactly as specified in prompt format
-        confidence_match = re.search(r"\nConfidence: (.*?)(?:\n|$)", response)
-        if confidence_match:
-            confidence_text = confidence_match.group(1).strip()
+        # Look for ALL confidence levels and take the last one
+        confidence_matches = re.findall(r"\nConfidence: (.*?)(?:\n|$)", response)
+        if confidence_matches:
+            confidence_text = confidence_matches[-1].strip()
             if confidence_text == "High":
                 return 1.0
             elif confidence_text == "Low":

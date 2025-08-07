@@ -150,6 +150,7 @@ class ConfidenceEnvironment(EnvironmentInterface):
         self,
         message_log_batch: list[list[dict[str, str]]],
         metadata: list[dict],
+        return_extracted_answer: bool = False,
     ) -> EnvironmentReturn:
         assistant_response_batch = []
         for conversation in message_log_batch:
@@ -190,6 +191,7 @@ class ConfidenceEnvironment(EnvironmentInterface):
             next_stop_strings=next_stop_strings,
             rewards=rewards,
             terminateds=terminateds,
+            answers=[],
         )
 
     def global_post_process_and_metrics(

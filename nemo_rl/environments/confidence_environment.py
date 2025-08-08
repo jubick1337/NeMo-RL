@@ -84,18 +84,44 @@ class VerifyConfidenceWorker:
                 )  # No think token, assumes model didn't finish thinking or follow format
                 extracted_answers.append({"mathematical_answer": "", "confidence": ""})
                 continue
-            # Find the last 'Answer: \\boxed{...}' line (line-anchored)
+            # Enforce STRICT final-output format:
+            # - Exactly one line 'Answer: \\boxed{...}' (line-anchored)
+            # - Exactly one line 'Confidence: High|Low' (line-anchored)
+            # - Confidence appears AFTER Answer
+            # - Nothing except whitespace is present after the Confidence line
+
+            # 1) Answer line occurrences must be exactly one
             answer_iters = list(
                 re.finditer(r"(?m)^\s*Answer:\s*\\boxed{([^}]*)}\s*$", response)
             )
-            if answer_iters:
-                parseble_response = f"\\boxed{{{answer_iters[-1].group(1)}}}"
-            else:
-                results.append(
-                    self.reward_no_confidence
-                )  # No boxed response, assumes model didn't follow format
+            if len(answer_iters) != 1:
+                results.append(self.reward_no_confidence)
                 extracted_answers.append({"mathematical_answer": "", "confidence": ""})
                 continue
+            parseble_response = f"\\boxed{{{answer_iters[0].group(1)}}}"
+
+            # 2) Confidence line occurrences must be exactly one
+            confidence_iters = list(
+                re.finditer(r"(?m)^\s*Confidence:\s*(High|Low)\s*$", response)
+            )
+            if len(confidence_iters) != 1:
+                results.append(self.reward_no_confidence)
+                extracted_answers.append({"mathematical_answer": "", "confidence": ""})
+                continue
+
+            # 3) Confidence must come after Answer
+            if confidence_iters[0].start() < answer_iters[0].end():
+                results.append(self.reward_no_confidence)
+                extracted_answers.append({"mathematical_answer": "", "confidence": ""})
+                continue
+
+            # 4) Only whitespace allowed after the Confidence line
+            if response[confidence_iters[0].end() :].strip() != "":
+                results.append(self.reward_no_confidence)
+                extracted_answers.append({"mathematical_answer": "", "confidence": ""})
+                continue
+
+            confidence_text = confidence_iters[0].group(1)
             with _mute_output():
                 try:
                     # Wrap ground truth in \boxed{} format for math verification
@@ -107,7 +133,7 @@ class VerifyConfidenceWorker:
 
                     # Extract both mathematical answer and confidence
                     mathematical_answer = ""
-                    confidence = ""
+                    confidence = confidence_text
 
                     # Extract mathematical answer similar to math environment logic
                     if return_extracted_answer and extracted_answer_result is not None:
@@ -132,14 +158,6 @@ class VerifyConfidenceWorker:
                             answer_found if answer_found is not None else ""
                         )
 
-                    # Extract confidence level (use last line-anchored 'Confidence: ...')
-                    if return_extracted_answer:
-                        confidence_matches = re.findall(
-                            r"(?m)^\s*Confidence:\s*(High|Low)\s*$", response
-                        )
-                        if confidence_matches:
-                            confidence = confidence_matches[-1]
-
                     extracted_answers.append(
                         {
                             "mathematical_answer": mathematical_answer,
@@ -152,7 +170,8 @@ class VerifyConfidenceWorker:
                     extracted_answers.append(
                         {"mathematical_answer": "", "confidence": ""}
                     )
-            confidence_level = self.parse_confidence_level(response)
+            # Use strictly parsed confidence line to determine level
+            confidence_level = 1.0 if confidence_text == "High" else 0.0
             final_reward = 0.0
             if is_correct:
                 if confidence_level == 1.0:

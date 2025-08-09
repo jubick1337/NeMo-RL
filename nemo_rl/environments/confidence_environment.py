@@ -17,22 +17,33 @@ from nemo_rl.environments.utils import chunk_list_to_workers
 class ConfidenceEnvConfig(TypedDict):
     num_workers: int
     verifier_type: Optional[str]
+    # Parsing/format policy
+    strict: Optional[bool]  # Default True. If False, use relaxed policy.
     # Optional reward configuration
     reward_correct_high: Optional[float]
     reward_correct_low: Optional[float]
     reward_incorrect_low: Optional[float]
     reward_incorrect_high: Optional[float]
     reward_no_confidence: Optional[float]
+    reward_format_penalty: Optional[float]  # Small penalty for trailing-format violations (relaxed mode)
 
 
 @ray.remote  # pragma: no cover
 class VerifyConfidenceWorker:
-    def __init__(self, reward_scheme: dict):
+    def __init__(self, reward_scheme: dict, strict: bool = True):
+        # Rewards
         self.reward_correct_high = reward_scheme["reward_correct_high"]
         self.reward_correct_low = reward_scheme["reward_correct_low"]
         self.reward_incorrect_low = reward_scheme["reward_incorrect_low"]
         self.reward_incorrect_high = reward_scheme["reward_incorrect_high"]
         self.reward_no_confidence = reward_scheme["reward_no_confidence"]
+        self.reward_format_penalty = reward_scheme.get("reward_format_penalty", -0.1)
+
+        # Policy
+        self.strict = strict
+
+        # In this environment, predictions already exclude EOS-like artifacts
+        # so relaxed mode only allows whitespace after the confidence line.
 
         # Initialize the math verification function
         self.verify_func = math_metric(
@@ -43,25 +54,7 @@ class VerifyConfidenceWorker:
             ),
         )
 
-    def parse_confidence_level(self, response: str) -> float:
-        """Returns 1.0 for High, 0.0 for Low, and -1.0 for no/invalid confidence.
-
-        Matches lines that begin with 'Confidence:' (multiline), allowing leading
-        whitespace and only 'High' or 'Low' with no trailing text. Uses the last match.
-        """
-        confidence_matches = re.findall(
-            r"(?m)^\s*Confidence:\s*(High|Low)\s*$", response
-        )
-        if confidence_matches:
-            confidence_text = confidence_matches[-1]
-            if confidence_text == "High":
-                return 1.0
-            elif confidence_text == "Low":
-                return 0.0
-            else:
-                return -1.0  # Invalid confidence level
-        else:
-            return -1.0
+    # parse_confidence_level helper removed (unused)
 
     def verify(
         self,
@@ -79,55 +72,91 @@ class VerifyConfidenceWorker:
                     last_think_token.start() + len("</think>") :
                 ]  # We do not care what's inside of <think> </think>
             else:
-                results.append(
-                    self.reward_no_confidence
-                )  # No think token, assumes model didn't finish thinking or follow format
-                extracted_answers.append({"mathematical_answer": "", "confidence": ""})
-                continue
+                # Strict mode requires </think>; relaxed mode parses full response
+                if self.strict:
+                    results.append(self.reward_no_confidence)
+                    extracted_answers.append({"mathematical_answer": "", "confidence": ""})
+                    continue
             # Enforce STRICT final-output format:
             # - Exactly one line 'Answer: \\boxed{...}' (line-anchored)
             # - Exactly one line 'Confidence: High|Low' (line-anchored)
             # - Confidence appears AFTER Answer
             # - Nothing except whitespace is present after the Confidence line
 
-            # 1) Answer line occurrences must be exactly one
+            # 1) Answer line occurrences policy
+            penalize_format = False
             answer_iters = list(
                 re.finditer(r"(?m)^\s*Answer:\s*\\boxed{([^}]*)}\s*$", response)
             )
-            if len(answer_iters) != 1:
-                results.append(self.reward_no_confidence)
-                extracted_answers.append({"mathematical_answer": "", "confidence": ""})
-                continue
-            parseble_response = f"\\boxed{{{answer_iters[0].group(1)}}}"
+            if self.strict:
+                if len(answer_iters) != 1:
+                    results.append(self.reward_no_confidence)
+                    extracted_answers.append({"mathematical_answer": "", "confidence": ""})
+                    continue
+                answer_match = answer_iters[0]
+            else:
+                if len(answer_iters) == 0:
+                    # Relaxed: penalize missing Answer and skip grading
+                    results.append(self.reward_format_penalty)
+                    extracted_answers.append({"mathematical_answer": "", "confidence": ""})
+                    continue
+                # Use last occurrence; penalize duplication
+                answer_match = answer_iters[-1]
+                if len(answer_iters) != 1:
+                    penalize_format = True
+            parsable_response = f"\\boxed{{{answer_match.group(1)}}}"
 
-            # 2) Confidence line occurrences must be exactly one
+            # 2) Confidence line occurrences policy
             confidence_iters = list(
                 re.finditer(r"(?m)^\s*Confidence:\s*(High|Low)\s*$", response)
             )
-            if len(confidence_iters) != 1:
-                results.append(self.reward_no_confidence)
-                extracted_answers.append({"mathematical_answer": "", "confidence": ""})
-                continue
+            if self.strict:
+                if len(confidence_iters) != 1:
+                    results.append(self.reward_no_confidence)
+                    extracted_answers.append({"mathematical_answer": "", "confidence": ""})
+                    continue
+                confidence_match = confidence_iters[0]
+            else:
+                if len(confidence_iters) == 0:
+                    # Relaxed: penalize missing Confidence and skip grading
+                    results.append(self.reward_format_penalty)
+                    extracted_answers.append({"mathematical_answer": "", "confidence": ""})
+                    continue
+                confidence_match = confidence_iters[-1]
+                if len(confidence_iters) != 1:
+                    penalize_format = True
 
             # 3) Confidence must come after Answer
-            if confidence_iters[0].start() < answer_iters[0].end():
-                results.append(self.reward_no_confidence)
-                extracted_answers.append({"mathematical_answer": "", "confidence": ""})
-                continue
+            if confidence_match.start() < answer_match.end():
+                if self.strict:
+                    results.append(self.reward_no_confidence)
+                    extracted_answers.append({"mathematical_answer": "", "confidence": ""})
+                    continue
+                else:
+                    penalize_format = True
 
-            # 4) Only whitespace allowed after the Confidence line
-            if response[confidence_iters[0].end() :].strip() != "":
-                results.append(self.reward_no_confidence)
-                extracted_answers.append({"mathematical_answer": "", "confidence": ""})
-                continue
+            # 4) Trailing content policy after the Confidence line
+            trailing_text = response[confidence_match.end() :]
+            trailing_trimmed = trailing_text.strip()
+            if self.strict:
+                # Strict: only whitespace allowed
+                if trailing_trimmed != "":
+                    results.append(self.reward_no_confidence)
+                    extracted_answers.append({"mathematical_answer": "", "confidence": ""})
+                    continue
+            else:
+                # Relaxed: any extra trailing non-whitespace triggers a small format penalty,
+                # but we still attempt grading if we have both Answer and Confidence.
+                if trailing_trimmed != "":
+                    penalize_format = True
 
-            confidence_text = confidence_iters[0].group(1)
+            confidence_text = confidence_match.group(1)
             with _mute_output():
                 try:
                     # Wrap ground truth in \boxed{} format for math verification
                     ground_truth_boxed = f"\\boxed{{{ground_truth}}}"
                     ret_score, extracted_answer_result = self.verify_func(
-                        [ground_truth_boxed], [parseble_response]
+                        [ground_truth_boxed], [parsable_response]
                     )
                     is_correct = float(ret_score) == 1.0
 
@@ -170,7 +199,7 @@ class VerifyConfidenceWorker:
                     extracted_answers.append(
                         {"mathematical_answer": "", "confidence": ""}
                     )
-            # Use strictly parsed confidence line to determine level
+            # Use parsed confidence line to determine level
             confidence_level = 1.0 if confidence_text == "High" else 0.0
             final_reward = 0.0
             if is_correct:
@@ -195,6 +224,9 @@ class VerifyConfidenceWorker:
                     raise ValueError(
                         f"Invalid confidence level: {confidence_level} with incorrect answer {ground_truth} and response {response}"
                     )
+            # Apply a small format penalty in relaxed mode if non-fatal issues occurred
+            if not self.strict and penalize_format:
+                final_reward += self.reward_format_penalty
             results.append(final_reward)
 
         if return_extracted_answer:
@@ -208,6 +240,7 @@ class ConfidenceEnvironment(EnvironmentInterface):
     def __init__(self, cfg: ConfidenceEnvConfig):
         self.cfg = cfg
         self.num_workers = cfg["num_workers"]
+        self.strict = cfg.get("strict", True)
         worker_cls = {
             "confidence_verify": VerifyConfidenceWorker,
         }[cfg.get("verifier_type", "confidence_verify")]
@@ -218,12 +251,14 @@ class ConfidenceEnvironment(EnvironmentInterface):
             "reward_incorrect_low": cfg.get("reward_incorrect_low", 0.0),
             "reward_incorrect_high": cfg.get("reward_incorrect_high", -0.5),
             "reward_no_confidence": cfg.get("reward_no_confidence", -1.0),
+            # Small fixed penalty for relaxed-mode format violations after confidence line
+            "reward_format_penalty": cfg.get("reward_format_penalty", -0.1),
         }
 
         self.workers = [
             worker_cls.options(  # type: ignore # (decorated with @ray.remote)
                 runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}
-            ).remote(self.reward_scheme)  # Pass config to worker
+            ).remote(self.reward_scheme, self.strict)  # Pass config and strict flag to worker
             for _ in range(self.num_workers)
         ]
 

@@ -25,7 +25,9 @@ class ConfidenceEnvConfig(TypedDict):
     reward_incorrect_low: Optional[float]
     reward_incorrect_high: Optional[float]
     reward_no_confidence: Optional[float]
-    reward_format_penalty: Optional[float]  # Small penalty for trailing-format violations (relaxed mode)
+    reward_format_penalty: Optional[
+        float
+    ]  # Small penalty for trailing-format violations (relaxed mode)
 
 
 @ray.remote  # pragma: no cover
@@ -75,7 +77,9 @@ class VerifyConfidenceWorker:
                 # Strict mode requires </think>; relaxed mode parses full response
                 if self.strict:
                     results.append(self.reward_no_confidence)
-                    extracted_answers.append({"mathematical_answer": "", "confidence": ""})
+                    extracted_answers.append(
+                        {"mathematical_answer": "", "confidence": ""}
+                    )
                     continue
             # Enforce STRICT final-output format:
             # - Exactly one line 'Answer: \\boxed{...}' (line-anchored)
@@ -91,14 +95,18 @@ class VerifyConfidenceWorker:
             if self.strict:
                 if len(answer_iters) != 1:
                     results.append(self.reward_no_confidence)
-                    extracted_answers.append({"mathematical_answer": "", "confidence": ""})
+                    extracted_answers.append(
+                        {"mathematical_answer": "", "confidence": ""}
+                    )
                     continue
                 answer_match = answer_iters[0]
             else:
                 if len(answer_iters) == 0:
                     # Relaxed: penalize missing Answer and skip grading
                     results.append(self.reward_format_penalty)
-                    extracted_answers.append({"mathematical_answer": "", "confidence": ""})
+                    extracted_answers.append(
+                        {"mathematical_answer": "", "confidence": ""}
+                    )
                     continue
                 # Use last occurrence; penalize duplication
                 answer_match = answer_iters[-1]
@@ -113,14 +121,18 @@ class VerifyConfidenceWorker:
             if self.strict:
                 if len(confidence_iters) != 1:
                     results.append(self.reward_no_confidence)
-                    extracted_answers.append({"mathematical_answer": "", "confidence": ""})
+                    extracted_answers.append(
+                        {"mathematical_answer": "", "confidence": ""}
+                    )
                     continue
                 confidence_match = confidence_iters[0]
             else:
                 if len(confidence_iters) == 0:
                     # Relaxed: penalize missing Confidence and skip grading
                     results.append(self.reward_format_penalty)
-                    extracted_answers.append({"mathematical_answer": "", "confidence": ""})
+                    extracted_answers.append(
+                        {"mathematical_answer": "", "confidence": ""}
+                    )
                     continue
                 confidence_match = confidence_iters[-1]
                 if len(confidence_iters) != 1:
@@ -130,7 +142,9 @@ class VerifyConfidenceWorker:
             if confidence_match.start() < answer_match.end():
                 if self.strict:
                     results.append(self.reward_no_confidence)
-                    extracted_answers.append({"mathematical_answer": "", "confidence": ""})
+                    extracted_answers.append(
+                        {"mathematical_answer": "", "confidence": ""}
+                    )
                     continue
                 else:
                     penalize_format = True
@@ -142,7 +156,9 @@ class VerifyConfidenceWorker:
                 # Strict: only whitespace allowed
                 if trailing_trimmed != "":
                     results.append(self.reward_no_confidence)
-                    extracted_answers.append({"mathematical_answer": "", "confidence": ""})
+                    extracted_answers.append(
+                        {"mathematical_answer": "", "confidence": ""}
+                    )
                     continue
             else:
                 # Relaxed: any extra trailing non-whitespace triggers a small format penalty,
@@ -258,7 +274,9 @@ class ConfidenceEnvironment(EnvironmentInterface):
         self.workers = [
             worker_cls.options(  # type: ignore # (decorated with @ray.remote)
                 runtime_env={"py_executable": PY_EXECUTABLES.SYSTEM}
-            ).remote(self.reward_scheme, self.strict)  # Pass config and strict flag to worker
+            ).remote(
+                self.reward_scheme, self.strict
+            )  # Pass config and strict flag to worker
             for _ in range(self.num_workers)
         ]
 

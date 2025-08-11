@@ -37,6 +37,9 @@ class ClippedPGLossConfig(TypedDict):
     use_on_policy_kl_approximation: bool
     use_importance_sampling_correction: bool
     token_level_loss: bool
+    # Optional temperature at which to compute temperature-adjusted entropy.
+    # If None or missing, the metric is disabled.
+    entropy_temperature: Optional[float]
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -102,6 +105,10 @@ class ClippedPGLossFn(LossFunction):
             "use_importance_sampling_correction"
         ]
 
+        # Temperature for temperature-adjusted entropy logging (nats). If None, disabled.
+        self.entropy_temperature: Optional[float] = cfg.get("entropy_temperature", None)
+
+        # Loss type configuration
         self.loss_type = (
             LossType.TOKEN_LEVEL if cfg["token_level_loss"] else LossType.SEQUENCE_LEVEL
         )
@@ -272,6 +279,47 @@ class ClippedPGLossFn(LossFunction):
                 global_normalization_factor=global_valid_toks,
             )
 
+        # Optionally compute full temperature-adjusted entropy H_T = -E[sum_v p_T(v|ctx) log p_T(v|ctx)]
+        # Best-effort: skip safely on vocab-parallel or any error (e.g., OOM).
+        full_entropy_metric: Optional[float] = None
+        if self.entropy_temperature is not None:
+            try:
+                T = float(self.entropy_temperature)
+
+                # If vocab is partitioned (Megatron vocab-parallel), computing exact full entropy is not supported here.
+                if vocab_parallel_group is not None:
+                    raise RuntimeError(
+                        "Full entropy not supported with vocab-parallel logits"
+                    )
+
+                # Bring logits to a dense local tensor if needed.
+                logits_local = next_token_logits
+                if isinstance(logits_local, torch.distributed.tensor.DTensor):  # type: ignore[attr-defined]
+                    # For DTensor with TP=1 this is replicated; to_local yields the full logits.
+                    logits_local = logits_local.to_local()
+
+                # Use all positions except last (to align with next-token setup)
+                logits_local = logits_local[:, :-1, :].to(torch.float32)
+
+                # Scale by temperature and compute log_softmax over vocab
+                scaled_logits = logits_local / T
+                log_probs_full = torch.log_softmax(scaled_logits, dim=-1)
+                probs_full = torch.exp(log_probs_full)
+
+                # Per-token full entropy in nats
+                per_token_entropy = -(probs_full * log_probs_full).sum(dim=-1)
+
+                # Mask to assistant tokens and valid samples, then globally normalize by tokens
+                full_entropy = masked_mean(
+                    per_token_entropy,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                )
+                full_entropy_metric = float(full_entropy.item())
+            except Exception:
+                # Silently skip metric on any failure (e.g., OOM) to avoid disrupting training.
+                full_entropy_metric = None
+
         loss = actor_loss + kl
         with torch.no_grad():
             probs_ratio = masked_mean(
@@ -299,6 +347,12 @@ class ClippedPGLossFn(LossFunction):
                 "sampling_importance_ratio": sample_importance_ratio.item(),
                 "num_valid_samples": sample_mask.sum().item(),
                 "approx_entropy": seq_entropy_approx.item(),
+                # Use an explicit, consistent metric name for W&B charts across runs/temperatures
+                **(
+                    {"temperature_adjusted_entropy": full_entropy_metric}
+                    if full_entropy_metric is not None
+                    else {}
+                ),
             },
         )
 

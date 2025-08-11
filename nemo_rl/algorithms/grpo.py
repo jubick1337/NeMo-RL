@@ -150,6 +150,12 @@ def setup(
     policy_config = master_config["policy"]
     generation_config = master_config["policy"]["generation"]
     loss_config = master_config["loss_fn"]
+    # Extract generation temperature
+    gen_temperature: Optional[float] = None
+    if isinstance(generation_config, dict):
+        t = generation_config.get("temperature")
+        if isinstance(t, (int, float)):
+            gen_temperature = float(t)
     grpo_config = master_config["grpo"]
     data_config = master_config["data"]
     logger_config = master_config["logger"]
@@ -359,6 +365,19 @@ def setup(
     # prepare refit info
     state_dict_info = policy.prepare_refit_info()
     policy_generation.prepare_refit_info(state_dict_info)
+
+    # If user provided entropy_temperature, assert it matches generation temperature.
+    if (
+        isinstance(loss_config, dict)
+        and loss_config.get("entropy_temperature") is not None
+        and gen_temperature is not None
+    ):
+        assert float(loss_config["entropy_temperature"]) == float(gen_temperature), (
+            f"loss_fn.entropy_temperature ({loss_config['entropy_temperature']}) must match generation.temperature ({gen_temperature})"
+        )
+    # Otherwise, set it from generation temperature
+    if isinstance(loss_config, dict) and loss_config.get("entropy_temperature") is None:
+        loss_config["entropy_temperature"] = gen_temperature
 
     loss_fn = ClippedPGLossFn(loss_config)
 

@@ -1,5 +1,5 @@
 # GRPO Algorithm Configuration
-defaults: "grpo-deepscaler-1.5b-8K.yaml"
+defaults: "recipes/llm/grpo-deepscaler-1.5b-8K.yaml"
 
 loss_fn:
   reference_policy_kl_penalty: 0.001

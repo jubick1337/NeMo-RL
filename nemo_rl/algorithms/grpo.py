@@ -401,6 +401,80 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     return vllm_cfg.get("async_engine", False)
 
 
+def _call_env_global_post_process_and_metrics(
+    batch: BatchedDataDict[DatumSpec],
+    task_to_env: Optional[dict[str, EnvironmentInterface]],
+) -> dict[str, float | int]:
+    """Group samples by task and call each environment's global post process hook.
+
+    Returns a flat dict of metrics with keys namespaced by env name (e.g., env/math/accuracy).
+    """
+    if task_to_env is None or len(batch) == 0:
+        return {}
+
+    if "task_name" not in batch or len(batch["task_name"]) == 0:
+        return {}
+
+    import ray
+
+    # Group indices by task
+    task_groups: dict[str, list[int]] = {}
+    for i, name in enumerate(batch["task_name"]):
+        task_groups.setdefault(name, []).append(i)
+
+    futures = []
+    env_names: list[str] = []
+    for task_name, indices in task_groups.items():
+        if task_name not in task_to_env:
+            continue
+
+        # Build a minimal batch expected by env hooks
+        env_batch = BatchedDataDict()
+        # Required/commonly used fields
+        for key in [
+            "idx",
+            "task_name",
+            "total_reward",
+            "rewards",
+            "is_end",
+            "generation_lengths",
+            "prompt_lengths",
+            "text",
+        ]:
+            if key in batch:
+                value = batch[key]
+                if isinstance(value, list):
+                    env_batch[key] = [value[i] for i in indices]
+                else:
+                    try:
+                        env_batch[key] = value[indices]
+                    except Exception:
+                        # Fallback to list-based indexing for non-tensors
+                        env_batch[key] = [value[i] for i in indices]
+
+        # Some envs expect 'rewards' key; alias from total_reward if missing
+        if "rewards" not in env_batch and "total_reward" in env_batch:
+            env_batch["rewards"] = env_batch["total_reward"]
+
+        # Call ray remote hook
+        futures.append(
+            task_to_env[task_name].global_post_process_and_metrics.remote(env_batch)  # type: ignore
+        )
+        env_names.append(task_name)
+
+    if not futures:
+        return {}
+
+    results = ray.get(futures)
+    # results: list[tuple[batch, metrics]]; we ignore returned batch and only use metrics
+    merged_metrics: dict[str, float | int] = {}
+    for env_name, (_, metrics) in zip(env_names, results):
+        for k, v in metrics.items():
+            merged_metrics[f"env/{env_name}/{k}"] = v
+
+    return merged_metrics
+
+
 def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
@@ -600,6 +674,13 @@ def grpo_train(
                         greedy=False,
                     )
                 policy_generation.finish_generation()
+
+            # Per-environment global post processing and metrics
+            with timer.time("env_global_post_process"):
+                env_metrics = _call_env_global_post_process_and_metrics(
+                    repeated_batch, task_to_env
+                )
+                rollout_metrics.update(env_metrics)
 
             # Calculate rewards & advantages
             print("▶ Processing rewards...")
@@ -928,6 +1009,11 @@ def validate(
                 )
             rewards = val_batch["total_reward"]
 
+            # Per-environment global post processing and metrics for validation batch
+            env_metrics = _call_env_global_post_process_and_metrics(
+                val_batch, val_task_to_env
+            )
+
             total_rewards.extend(rewards.tolist())
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
 
@@ -949,6 +1035,9 @@ def validate(
             "accuracy": accuracy,
             "avg_length": avg_length,
         }
+
+        # Merge env metrics into validation metrics
+        val_metrics.update(env_metrics)
 
         # Print sample conversations only once at the end of validation
         try:

@@ -443,14 +443,12 @@ def _call_env_global_post_process_and_metrics(
         ]:
             if key in batch:
                 value = batch[key]
-                if isinstance(value, list):
+                if key in {"idx", "task_name"}:
                     env_batch[key] = [value[i] for i in indices]
+                elif isinstance(value, (torch.Tensor, np.ndarray)):
+                    env_batch[key] = value[indices]
                 else:
-                    try:
-                        env_batch[key] = value[indices]
-                    except Exception:
-                        # Fallback to list-based indexing for non-tensors
-                        env_batch[key] = [value[i] for i in indices]
+                    env_batch[key] = [value[i] for i in indices]
 
         # Some envs expect 'rewards' key; alias from total_reward if missing
         if "rewards" not in env_batch and "total_reward" in env_batch:

@@ -53,6 +53,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
+from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
 class VllmSpecificArgs(TypedDict):
@@ -286,7 +287,8 @@ class VllmGenerationWorker:
             raise ImportError(
                 "vLLM is not installed. Please check that the py_executable in the runtime_env of VllmGenerationWorker "
                 "covers the vllm dependency. You may have to update nemo_rl/distributed/ray_actor_environment_registry.py. "
-                "If you are working interactively, you can install by running  `uv sync --extra vllm` anywhere in the repo."
+                "This error can also happen if the venv creation was aborted or errored out in the middle. In that case, "
+                "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
             )
         vllm_kwargs: dict[str, Any] = copy.deepcopy(self.cfg.get("vllm_kwargs", {}))
 
@@ -321,6 +323,18 @@ class VllmGenerationWorker:
         load_format = self.cfg["vllm_cfg"]["load_format"]
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
+
+        if (
+            len(get_nsight_config_if_pattern_matches("vllm_generation_worker")) > 0
+            and vllm_kwargs["distributed_executor_backend"] == "ray"
+        ):
+            logger.warning(
+                "Nsight profiling is enabled for vllm generation worker through the vllm ray distributed executor. "
+                "The nsight command-line args and output file names are automatically picked by the ray distributed "
+                "executor. Refer to https://github.com/vllm-project/vllm/blob/7e3a8dc90670fd312ce1e0d4eba9bf11c571e3ad/vllm/executor/ray_distributed_executor.py#L136 "
+                "for more information."
+            )
+            vllm_kwargs["ray_workers_use_nsight"] = True
 
         llm_kwargs = dict(
             model=self.model_name,
@@ -435,6 +449,7 @@ class VllmGenerationWorker:
             include_stop_str_in_output=True,
         )
 
+    @wrap_with_nvtx_name("vllm_genertion_worker/generate")
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
@@ -798,6 +813,7 @@ class VllmGenerationWorker:
                 await asyncio.gather(*sample_tasks, return_exceptions=True)
                 raise e
 
+    @wrap_with_nvtx_name("vllm_genertion_worker/generate_text")
     def generate_text(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
@@ -1032,6 +1048,7 @@ class VllmGenerationWorker:
         """Async version of prepare_refit_info."""
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
+    @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_ipc_handles")
     def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
         """Update weights from IPC handles by delegating to the vLLM Worker implementation.
 
@@ -1143,6 +1160,7 @@ class VllmGenerationWorker:
             traceback.print_exc()
             return False
 
+    @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_collective")
     def update_weights_from_collective(self) -> bool:
         """Update the model weights from collective communication."""
         try:
@@ -1316,10 +1334,14 @@ class VllmGenerationWorker:
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
         torch.cuda.profiler.start()
+        if self.llm is not None:
+            self.llm.collective_rpc("start_gpu_profiling", args=tuple())
 
     def stop_gpu_profiling(self) -> None:
         """Stop GPU profiling."""
         torch.cuda.profiler.stop()
+        if self.llm is not None:
+            self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
 
 
 class VllmGeneration(GenerationInterface):
@@ -1362,13 +1384,21 @@ class VllmGeneration(GenerationInterface):
             "tensor_parallel"
         ) * self.sharding_annotations.get_axis_size("pipeline_parallel")
 
+        # non-colocated needs to use PACK strategy to avoid uneven node_bundles
+        # e.g. assuming we use 3 nodes with 8GPUs, 2 nodes for train and 1 node for inference.
+        # if we use SPREAD, then the node bundles will be something like 0: [0,3,6] 1: [1,4,7] 2: [2,5], which is not correct.
+        strategy = None if self.cfg["colocated"]["enabled"] else "PACK"
+
         # Determine if we need cross-node model parallelism
         needs_cross_node_parallelism = (
             self.model_parallel_size > cluster.num_gpus_per_node
         )
 
         # Initialize placement groups with the appropriate mode
-        cluster._init_placement_groups(use_unified_pg=needs_cross_node_parallelism)
+        cluster._init_placement_groups(
+            strategy=strategy,
+            use_unified_pg=needs_cross_node_parallelism,
+        )
 
         # Create worker builder for VllmGenerationWorker
         worker_builder = RayWorkerBuilder(
@@ -1380,7 +1410,7 @@ class VllmGeneration(GenerationInterface):
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
         env_vars = {}
         if not self.cfg["colocated"]["enabled"]:
-            os.environ["NCCL_CUMEM_ENABLE"] = "1"
+            env_vars["NCCL_CUMEM_ENABLE"] = "1"
 
         # Check if we need parallelism-aware worker group creation
         if self.model_parallel_size > 1:

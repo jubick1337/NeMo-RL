@@ -415,8 +415,6 @@ def _call_env_global_post_process_and_metrics(
     if "task_name" not in batch or len(batch["task_name"]) == 0:
         return {}
 
-    import ray
-
     # Group indices by task
     task_groups: dict[str, list[int]] = {}
     for i, name in enumerate(batch["task_name"]):

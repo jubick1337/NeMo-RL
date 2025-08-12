@@ -586,6 +586,8 @@ def grpo_train(
     val_period = master_config["grpo"]["val_period"]
     val_at_start = master_config["grpo"]["val_at_start"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+    # Persist latest validation metrics across steps so checkpoints always carry the metric
+    latest_val_metrics: Optional[dict[str, Any]] = None
 
     # Run validation at the start if configured
     if val_at_start and step == 0:
@@ -606,6 +608,7 @@ def grpo_train(
         policy_generation.finish_generation()
         logger.log_metrics(val_metrics, step, prefix="validation")
         logger.log_metrics(validation_timings, step, prefix="timing/validation")
+        latest_val_metrics = val_metrics
 
     # Run grpo training (single-turn)
     batch: BatchedDataDict[DatumSpec]
@@ -796,6 +799,7 @@ def grpo_train(
                     validation_timings, step + 1, prefix="timing/validation"
                 )
                 logger.log_metrics(val_metrics, step + 1, prefix="validation")
+                latest_val_metrics = val_metrics
 
             ## Checkpointing
             consumed_samples += master_config["grpo"]["num_prompts_per_step"]
@@ -815,10 +819,17 @@ def grpo_train(
                 policy.prepare_for_training()
 
                 grpo_save_state["step"] = step + 1
-                if val_metrics is not None:
-                    grpo_save_state["val_reward"] = val_metrics["accuracy"]
-                elif "val_reward" in grpo_save_state:
-                    del grpo_save_state["val_reward"]
+                # Determine which validation metrics to store for checkpoint ranking
+                metrics_to_store = (
+                    val_metrics if val_metrics is not None else latest_val_metrics
+                )
+                if metrics_to_store is not None:
+                    # Backward-compatible key for default validation reward
+                    if "accuracy" in metrics_to_store:
+                        grpo_save_state["val_reward"] = metrics_to_store["accuracy"]
+                    # Store all available validation metrics (e.g., pass@samples_per_prompt)
+                    for mk, mv in metrics_to_store.items():
+                        grpo_save_state[mk] = mv
                 grpo_save_state["consumed_samples"] = consumed_samples
 
                 if master_config["checkpointing"]["metric_name"] is not None:

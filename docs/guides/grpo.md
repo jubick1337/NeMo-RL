@@ -202,7 +202,7 @@ $$
 \end{cases}
 $$
 
-The sample mask becomes (let m_i denote the sample mask and ℓ_i denote the loss multiplier to avoid underscores in rendering):
+The sample mask becomes (let m_i denote the sample mask and ℓ_i denote the loss multiplier):
 
 $$
 m_i = \ell_i \cdot (1 - \text{truncated}_i)

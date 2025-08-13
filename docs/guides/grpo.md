@@ -202,16 +202,16 @@ $$
 \end{cases}
 $$
 
-The sample mask becomes:
+The sample mask becomes (let m_i denote the sample mask and ℓ_i denote the loss multiplier to avoid underscores in rendering):
 
 $$
-\text{sample\_mask}_i = \text{loss\_multiplier}_i \cdot (1 - \text{truncated}_i)
+m_i = \ell_i \cdot (1 - \text{truncated}_i)
 $$
 
 This results in the effective loss:
 
 $$
-L_{\text{effective}} = \sum_{i} \text{sample\_mask}_i \cdot L_i
+L_{\text{effective}} = \sum_{i} m_i \cdot L_i
 $$
 
 where $L_i$ is the per-sample loss. Truncated samples contribute 0 to the gradient update while remaining in the batch for reward baseline calculations.

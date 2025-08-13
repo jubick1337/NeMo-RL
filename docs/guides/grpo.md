@@ -195,10 +195,10 @@ The implementation modifies the loss calculation as follows:
 
 For each sample $i$ in the batch:
 - Let $\text{truncated}_i = \begin{cases} 1 & \text{if sample } i \text{ reached max length without EOS} \\ 0 & \text{otherwise} \end{cases}$
-- The sample mask becomes: $\text{sample\_mask}_i = \text{loss\_multiplier}_i \cdot (1 - \text{truncated}_i)$
+- The sample mask becomes: $\text{sample_mask}_i = \text{loss_multiplier}_i \cdot (1 - \text{truncated}_i)$
 
 This results in the effective loss:
-$$L_{\text{effective}} = \sum_{i} \text{sample\_mask}_i \cdot L_i$$
+$$L_{\text{effective}} = \sum_{i} \text{sample_mask}_i \cdot L_i$$
 
 where $L_i$ is the per-sample loss. Truncated samples contribute 0 to the gradient update while remaining in the batch for reward baseline calculations.
 

@@ -84,8 +84,8 @@ class GRPOConfig(TypedDict):
     val_batch_size: int
     val_at_start: bool
     max_val_samples: int
-    overlong_filtering: bool
     seed: int
+    overlong_filtering: NotRequired[bool]
 
 
 class GRPOSaveState(TypedDict):
@@ -628,7 +628,7 @@ def grpo_train(
 
             with timer.time("data_processing"):
                 use_overlong_filtering = master_config["grpo"]["overlong_filtering"]
-                if use_overlong_filtering and "truncated" in repeated_batch:
+                if use_overlong_filtering:
                     loss_multiplier = repeated_batch["loss_multiplier"].clone()
                     truncated = repeated_batch["truncated"]
 
@@ -781,7 +781,6 @@ def grpo_train(
                         os.path.join(checkpoint_path, "train_dataloader.pt"),
                     )
                     checkpointer.finalize_checkpoint(checkpoint_path)
-                policy.offload_after_refit()
 
         # Logging
         # Log training data

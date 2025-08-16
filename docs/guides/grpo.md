@@ -107,7 +107,7 @@ This Policy object holds a [RayWorkerGroup](../../nemo_rl/distributed/worker_gro
 
 ## Fast Generation
 
-We support vLLM through the [VllmGeneration](../../nemo_rl/models/generation/vllm.py) class right now.
+We support vLLM through the [VllmGeneration](../../nemo_rl/models/generation/vllm/vllm_generation.py) class right now.
 
 The function [grpo_train](../../nemo_rl/algorithms/grpo.py) contains the core GRPO training loop.
 
@@ -194,11 +194,25 @@ When `overlong_filtering=True`, samples that reach `max_total_sequence_length` w
 The implementation modifies the loss calculation as follows:
 
 For each sample $i$ in the batch:
-- Let $\text{truncated}_i = \begin{cases} 1 & \text{if sample } i \text{ reached max length without EOS} \\ 0 & \text{otherwise} \end{cases}$
-- The sample mask becomes: $\text{sample\_mask}_i = \text{loss\_multiplier}_i \cdot (1 - \text{truncated}_i)$
+
+$$
+\text{truncated}_i = \begin{cases} 
+1 & \text{if sample } i \text{ reached max length without EOS} \\ 
+0 & \text{otherwise} 
+\end{cases}
+$$
+
+The sample mask becomes (let m_i denote the sample mask and ℓ_i denote the loss multiplier):
+
+$$
+m_i = \ell_i \cdot (1 - \text{truncated}_i)
+$$
 
 This results in the effective loss:
-$$L_{\text{effective}} = \sum_{i} \text{sample\_mask}_i \cdot L_i$$
+
+$$
+L_{\text{effective}} = \sum_{i} m_i \cdot L_i
+$$
 
 where $L_i$ is the per-sample loss. Truncated samples contribute 0 to the gradient update while remaining in the batch for reward baseline calculations.
 

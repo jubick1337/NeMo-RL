@@ -120,9 +120,9 @@ class IFEvalVerifyWorker:
             return None
             
         last_line = lines[-1].strip()
-        if last_line == "Confidence: High":
+        if last_line.lower() == "Confidence: High".lower():
             return "High"
-        elif last_line == "Confidence: Low":
+        elif last_line.lower() == "Confidence: Low".lower():
             return "Low"
         else:
             return None

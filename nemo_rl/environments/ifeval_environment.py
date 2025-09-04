@@ -1,3 +1,4 @@
+
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,6 +35,7 @@ from nemo_rl.environments.utils import chunk_list_to_workers
 class IFEvalEnvConfig(TypedDict):
     num_workers: int
     stop_strings: Optional[List[str]] = None  # Default stop strings for this env
+    use_confidence: bool = False  # Whether to use confidence-based reward modification
 
 
 @contextlib.contextmanager
@@ -55,12 +57,13 @@ class IFEvalEnvironmentMetadata(TypedDict):
 class IFEvalVerifyWorker:
     DEFAULT_PY_EXECUTABLE = PY_EXECUTABLES.IFEVAL
 
-    def __init__(self):
+    def __init__(self, use_confidence: bool = False):
         from nemo_rl.environments.instruction_following.instructions_registry import (
             INSTRUCTION_DICT,
         )
 
         self.INSTRUCTION_DICT = INSTRUCTION_DICT
+        self.use_confidence = use_confidence
         logging.getLogger("ifeval_verify").setLevel(logging.CRITICAL)
 
     def instruction_following_rewards(self, prompt, response, args):
@@ -95,10 +98,68 @@ class IFEvalVerifyWorker:
             low, high = 0, 1
             correctness = sum(is_following_list) / len(is_following_list)
             score = low + (high - low) * correctness
+            
+            # Apply confidence-based reward adjustment if enabled
+            if self.use_confidence:
+                confidence = self.parse_confidence(response)
+                score = self.calculate_confidence_adjusted_reward(score, confidence)
+            
             return score, True
         except Exception as e:
             print(f"Error in instruction_following_rewards: {e}")
             return 0, False
+    
+    def parse_confidence(self, response: str) -> Optional[str]:
+        """Parse confidence prediction from the model's output.
+        
+        Returns:
+            Optional[str]: 'High', 'Low', or None if not found
+        """
+        lines = response.strip().split('\n')
+        if not lines:
+            return None
+            
+        last_line = lines[-1].strip()
+        if last_line == "Confidence: High":
+            return "High"
+        elif last_line == "Confidence: Low":
+            return "Low"
+        else:
+            return None
+    
+    def calculate_confidence_adjusted_reward(self, task_score: float, confidence: Optional[str]) -> float:
+        """Calculate the final reward with confidence adjustment.
+        
+        Args:
+            task_score: Base score (0.0 to 1.0) based on instruction following
+            confidence: Predicted confidence ('High', 'Low', or None)
+            
+        Returns:
+            float: Final reward with confidence adjustment
+        """
+        if confidence is None:
+            # If no confidence prediction, return base score
+            return task_score
+            
+        # Determine if the confidence prediction is correct
+        is_perfect_score = task_score == 1.0
+        
+        if confidence == "High":
+            if is_perfect_score:
+                # Correct high confidence: +0.2 bonus
+                return task_score + 0.2
+            else:
+                # Overconfidence: -0.3 penalty
+                return task_score - 0.3
+        elif confidence == "Low":
+            if not is_perfect_score:
+                # Correct low confidence: +0.2 bonus
+                return task_score + 0.2
+            else:
+                # Underconfidence: -0.1 penalty
+                return task_score - 0.1
+        
+        return task_score
 
     def verify(
         self,
@@ -136,10 +197,12 @@ class IFEvalEnvironment(EnvironmentInterface):
     def __init__(self, cfg: IFEvalEnvConfig):
         self.cfg = cfg
         self.num_workers = cfg["num_workers"]
+        self.use_confidence = cfg.get("use_confidence", False)
+        print(f"Using confidence: {self.use_confidence}")
         self.workers = [
             IFEvalVerifyWorker.options(
                 runtime_env={"py_executable": IFEvalVerifyWorker.DEFAULT_PY_EXECUTABLE}
-            ).remote()
+            ).remote(self.use_confidence)
             for _ in range(self.num_workers)
         ]
 
